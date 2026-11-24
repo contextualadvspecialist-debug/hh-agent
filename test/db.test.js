@@ -126,3 +126,15 @@ test('сообщения дедуплицируются по ext_id', () => {
   assert.equal(addMessage(db, { chatId: 'c1', extId: '102', direction: 'out', text: 'Здравствуйте' }), true);
   assert.equal(listMessages(db, 'c1').length, 2);
 });
+
+test('повторное чтение исправляет направление ранее сохранённого сообщения', () => {
+  const db = openDb(':memory:');
+  try {
+    upsertChat(db, { id: 'c1', title: 'HR' });
+    assert.equal(addMessage(db, { chatId: 'c1', extId: '101', direction: 'out', text: 'Вопрос ИИ' }), true);
+    assert.equal(addMessage(db, { chatId: 'c1', extId: '101', direction: 'in', text: 'Вопрос ИИ' }), false);
+    assert.equal(listMessages(db, 'c1')[0].direction, 'in');
+  } finally {
+    db.close();
+  }
+});

@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { getContext, newPage, checkLoggedIn, closeContext } from './browser.js';
 import { searchQuery, getVacancyDetails, CaptchaError, detectCaptcha } from './hh-search.js';
 import { applyToVacancy, readResponseQuestions, fillResponseAnswers, submitResponseForm } from './hh-apply.js';
-import { listUnreadChats, listAllChats, readChat, sendChatMessage, cleanVacancyTitle } from './hh-chats.js';
+import { listUnreadChats, listAllChats, readChat, sendChatMessage, cleanVacancyTitle, extractFormLinks } from './hh-chats.js';
 import { listNegotiations } from './hh-status.js';
 import { isDuplicate, isDescriptionDuplicate } from './dedupe.js';
 import { withinWindow, msUntilWindow } from './schedule.js';
@@ -32,6 +32,36 @@ const localDayKey = (d = new Date()) =>
 
 const SEEN_BY_EMPLOYER = ['viewed', 'invitation', 'rejected', 'hired'];
 const POSITIVE = ['invitation', 'hired'];
+
+function chatRetryState(db) {
+  try {
+    const value = JSON.parse(kvGet(db, 'chatReadRetries', '{}'));
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function rememberChatRetry(db, chat, error) {
+  const retries = chatRetryState(db);
+  retries[chat.id] = {
+    id: chat.id,
+    title: chat.title ?? '',
+    subtitle: chat.subtitle ?? '',
+    last: chat.last ?? '',
+    time: chat.time ?? '',
+    error: String(error?.message ?? error).slice(0, 300),
+    updatedAt: new Date().toISOString()
+  };
+  kvSet(db, 'chatReadRetries', JSON.stringify(retries));
+}
+
+function clearChatRetry(db, chatId) {
+  const retries = chatRetryState(db);
+  if (!retries[chatId]) return;
+  delete retries[chatId];
+  kvSet(db, 'chatReadRetries', JSON.stringify(retries));
+}
 
 function funnelGroups(rows) {
   const map = new Map();
@@ -804,13 +834,14 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
   // Полный каталог чатов раз в день: в «только непрочитанные» попадают не все переписки.
   async refreshChatDirectory(page) {
     const key = `chatDir:${localDayKey()}`;
-    if (kvGet(this.db, key)) return;
+    if (kvGet(this.db, key)) return null;
     const list = await listAllChats(page, this.cfg);
     for (const c of list) {
       upsertChat(this.db, { id: c.id, title: c.title, subtitle: c.subtitle, vacancy: '', last: c.last, time: c.time });
     }
     kvSet(this.db, key, '1');
     this.log(`чаты: каталог обновлён (${list.length})`);
+    return list;
   }
 
   async checkChats() {
@@ -852,8 +883,9 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
 
   async checkChatsOnce() {
     const page = await this.page('chats');
+    let directory = null;
     try {
-      await this.refreshChatDirectory(page);
+      directory = await this.refreshChatDirectory(page);
     } catch (e) {
       this.log(`чаты: каталог не обновлён (${e.message})`);
     }
@@ -869,15 +901,49 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
       throw e;
     }
 
+    const backfillEveryMinutes = this.cfg.limits.chatsBackfillEveryMinutes ?? 120;
+    const recentLimit = this.cfg.limits.chatsRecentLimit ?? 20;
+    const lastBackfill = Date.parse(kvGet(this.db, 'lastChatBackfill', ''));
+    const backfillDue = !Number.isFinite(lastBackfill)
+      || Date.now() - lastBackfill >= backfillEveryMinutes * 60_000;
+    let recent = [];
+    if (backfillDue && backfillEveryMinutes > 0) {
+      try {
+        const all = directory ?? await listAllChats(page, this.cfg);
+        recent = all.slice(0, recentLimit);
+        for (const c of recent) {
+          upsertChat(this.db, { id: c.id, title: c.title, subtitle: c.subtitle, vacancy: '', last: c.last, time: c.time });
+        }
+        kvSet(this.db, 'lastChatBackfill', new Date().toISOString());
+        if (recent.length) this.log(`чаты: запланировано перечитывание последних ${recent.length}`);
+      } catch (e) {
+        this.log(`чаты: периодическая проверка не удалась (${e.message})`);
+      }
+    }
+
+    const retries = Object.values(chatRetryState(this.db))
+      .filter((c) => /^\d+$/.test(c.id))
+      .sort((a, b) => String(a.updatedAt).localeCompare(String(b.updatedAt)))
+      .slice(0, 10);
+    const candidates = [];
+    const seen = new Set();
+    for (const c of [...retries, ...chats.slice(0, 10), ...recent]) {
+      if (seen.has(c.id)) continue;
+      seen.add(c.id);
+      candidates.push(c);
+    }
+
     let pendingCount = 0;
-    for (const c of chats.slice(0, 10)) {
+    for (const c of candidates) {
       let data;
       try {
         data = await readChat(page, this.cfg, c.id);
       } catch (e) {
         this.log(`chat ${c.id}: ${e.message}`);
+        rememberChatRetry(this.db, c, e);
         continue;
       }
+      clearChatRetry(this.db, c.id);
 
       // Название вакансии надёжнее брать из своей базы по id из ссылки: в DOM
       // заголовок соседствует с кнопкой «Перейти».
@@ -902,15 +968,44 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
         });
       }
 
+      for (const url of extractFormLinks(data.messages.filter((m) => m.direction === 'in'))) {
+        const key = `notifiedForm:${c.id}:${url}`;
+        if (kvGet(this.db, key)) continue;
+        const title = data.employer || c.title || 'Чат hh';
+        const sent = await this.send(
+          `📝 <b>Новая анкета</b>\n${esc(title)}\n\nРаботодатель прислал форму для заполнения.`,
+          [[{ text: 'Открыть анкету', url }]]
+        );
+        if (sent) kvSet(this.db, key, '1');
+        else this.log(`форма ${c.id}: уведомление не доставлено, повторю`);
+      }
+
       const lastOut = data.messages.map((m) => m.direction).lastIndexOf('out');
       const pending = data.messages.slice(lastOut + 1).filter((m) => m.direction === 'in');
       if (!pending.length) continue;
 
       const lastKey = pending[pending.length - 1].extId;
-      if (kvGet(this.db, `notifiedChat:${c.id}`) === lastKey) continue;
+      const aiPending = pending.some((m) => m.isAi);
+      const notificationKey = aiPending ? `notifiedAiChat:${c.id}` : `notifiedChat:${c.id}`;
+      if (kvGet(this.db, notificationKey) === lastKey) continue;
       pendingCount++;
 
       const chat = getChat(this.db, c.id);
+      if (aiPending) {
+        const quote = pending
+          .slice(-3)
+          .map((m) => `<i>${esc(m.isAi ? 'ИИ-помощник' : m.author || 'Работодатель')}:</i> ${esc(m.text.slice(0, 600))}`)
+          .join('\n');
+        const title = chat?.title || c.title || 'Чат hh';
+        const sent = await this.send(
+          `<b>ИИ-помощник в чате</b>\n${esc(title)}${chat?.vacancy ? ` — ${esc(chat.vacancy)}` : ''}\n\n${quote}\n\nАвтоматически отвечать не буду — откройте чат и ответьте вручную.`,
+          [[{ text: 'Открыть чат', url: `${this.cfg.hh.base}/chat/${c.id}` }]]
+        );
+        if (sent) kvSet(this.db, notificationKey, lastKey);
+        else this.log(`chat ${c.id}: уведомление об ИИ-помощнике не доставлено, повторю`);
+        continue;
+      }
+
       let draft = '';
       if (this.llm) {
         try {

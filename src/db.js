@@ -233,11 +233,18 @@ export function getChat(db, chatId) {
 }
 
 export function addMessage(db, m) {
+  const values = [m.chatId, m.extId, m.direction, m.author ?? '', m.text, m.ts ?? '', now()];
   const res = db.prepare(`
     INSERT OR IGNORE INTO messages (chat_id, ext_id, direction, author, text, ts, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(m.chatId, m.extId, m.direction, m.author ?? '', m.text, m.ts ?? '', now());
-  return res.changes > 0;
+  `).run(...values);
+  if (res.changes > 0) return true;
+  // Повторное чтение чата исправляет старую классификацию, но не создаёт дубль.
+  db.prepare(`
+    UPDATE messages SET direction = ?, author = ?, text = ?, ts = ?
+    WHERE chat_id = ? AND ext_id = ?
+  `).run(m.direction, m.author ?? '', m.text, m.ts ?? '', m.chatId, m.extId);
+  return false;
 }
 
 export function listMessages(db, chatId, limit = 30) {
