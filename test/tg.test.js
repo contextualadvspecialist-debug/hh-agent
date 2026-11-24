@@ -1,0 +1,58 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { excerpt, vacancyText, truncateHtml, isOwnerUpdate } from '../src/tg.js';
+
+test('excerpt режет длинный текст по границе слова', () => {
+  const text = `${'слово '.repeat(40)}конец`;
+  const cut = excerpt(text, 100);
+  assert.ok(cut.length <= 101);
+  assert.ok(cut.endsWith('…'));
+});
+
+test('excerpt оставляет короткий текст как есть', () => {
+  assert.equal(excerpt('Короткое описание.'), 'Короткое описание.');
+});
+
+test('карточка вакансии показывает опыт и описание', () => {
+  const text = vacancyText({
+    id: '1',
+    title: 'AI-инженер',
+    company: 'ООО Тест',
+    salary: '100 000 ₽',
+    experience: 'between1And3',
+    score: 80,
+    resume: 'ai',
+    reason: 'ai, ии',
+    snippet: 'Делать чат-ботов на LLM и автоматизировать поддержку.'
+  });
+  assert.match(text, /Опыт: 1–3 года/);
+  assert.match(text, /О вакансии/);
+  assert.match(text, /чат-ботов на LLM/);
+});
+
+test('зарплата экранируется, чтобы HTML не ломался', () => {
+  const text = vacancyText({
+    id: '1', title: 'AI-инженер', company: 'C', salary: '100 <b>₽</b>', score: 80, resume: 'ai'
+  });
+  assert.ok(text.includes('100 &lt;b&gt;₽&lt;/b&gt;'));
+});
+
+test('truncateHtml не оставляет незакрытый тег', () => {
+  const cut = truncateHtml(`${'a'.repeat(3995)}<b>текст</b>`, 3998);
+  assert.ok(cut.endsWith('…'));
+  assert.ok(!cut.includes('<'));
+});
+
+test('truncateHtml не режет &entity пополам', () => {
+  const cut = truncateHtml(`${'a'.repeat(3994)}&amp;`, 3998);
+  assert.ok(cut.endsWith('…'));
+  assert.ok(!cut.includes('&'));
+});
+
+test('обновления принимаются только из чата владельца', () => {
+  assert.equal(isOwnerUpdate({ message: { chat: { id: 42 } } }, '42'), true);
+  assert.equal(isOwnerUpdate({ message: { chat: { id: 43 } } }, '42'), false);
+  assert.equal(isOwnerUpdate({ callback_query: { message: { chat: { id: 42 } } } }, '42'), true);
+  assert.equal(isOwnerUpdate({ callback_query: { id: 'x' } }, '42'), false);
+  assert.equal(isOwnerUpdate({ message: { text: '/scan' } }, '42'), false);
+});

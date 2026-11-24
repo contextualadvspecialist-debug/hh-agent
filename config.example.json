@@ -1,0 +1,82 @@
+{
+  "hh": {
+    "base": "https://spb.hh.ru",
+    "remoteOnly": true,
+    "itemsOnPage": 50,
+    "pages": 2,
+    "excludeCompanies": [],
+    "excludeKeywordExceptions": [
+      "водитель трафика"
+    ],
+    "excludeKeywords": [
+      "холодные звонки",
+      "продажи по телефону",
+      "только офис",
+      "без оплаты",
+      "неоплачиваем",
+      "курьер",
+      "водитель",
+      "бухгалтер",
+      "1С"
+    ],
+    "area": "113",
+    "queriesAI": [
+      "AI-специалист",
+      "промпт-инженер",
+      "специалист по нейросетям",
+      "нейросети для бизнеса",
+      "AI-ассистент",
+      "автоматизация бизнес-процессов",
+      "LLM",
+      "разработка чат-ботов"
+    ],
+    "queriesDirect": [
+      "директолог",
+      "специалист по Яндекс.Директ",
+      "контекстная реклама Яндекс Директ"
+    ],
+    "minSalary": 50000
+  },
+  "resumes": {
+    "direct": {
+      "id": "YOUR_HH_DIRECT_RESUME_ID",
+      "title": "Директолог"
+    },
+    "ai": {
+      "id": "YOUR_HH_AI_RESUME_ID",
+      "title": "AI-специалист"
+    }
+  },
+  "limits": {
+    "dailyApplications": 8,
+    "minDelaySec": 90,
+    "maxDelaySec": 240,
+    "scanEveryHours": 6,
+    "chatsEveryMinutes": 30,
+    "statusEveryHours": 3,
+    "digestHour": 20,
+    "followupWorkingDays": 3,
+    "dailyFollowups": 3,
+    "sendWindow": {
+      "from": 10,
+      "to": 19
+    }
+  },
+  "threshold": 55,
+  "autoApply": false,
+  "telegram": {
+    "token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "chatId": "YOUR_TELEGRAM_CHAT_ID"
+  },
+  "llm": {
+    "baseUrl": "https://api.deepseek.com/v1",
+    "apiKey": "YOUR_DEEPSEEK_OR_OPENAI_API_KEY",
+    "model": "deepseek-chat",
+    "reasoningEffort": "none"
+  },
+  "browser": {
+    "channel": "chrome",
+    "headless": false,
+    "profile": "profile"
+  }
+}

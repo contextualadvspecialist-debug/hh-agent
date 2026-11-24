@@ -1,0 +1,28 @@
+{
+  "name": "hh-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Агент поиска работы на hh.ru: поиск, скоринг, сопроводительные, отклики, чаты",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "login": "node src/cli.js login",
+    "scan": "node src/cli.js scan",
+    "chats": "node src/cli.js chats",
+    "letter": "node src/cli.js letter",
+    "apply": "node src/cli.js apply",
+    "statuses": "node src/cli.js statuses",
+    "digest": "node src/cli.js digest",
+    "block": "node src/cli.js block",
+    "unblock": "node src/cli.js unblock",
+    "check": "node src/cli.js check",
+    "run": "node src/cli.js run",
+    "task": "node src/cli.js task",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "playwright-core": "^1.50.0"
+  }
+}
