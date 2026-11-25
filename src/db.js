@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS chats (
   title TEXT,
   subtitle TEXT,
   vacancy TEXT,
+  vacancy_id TEXT DEFAULT '',
   last_text TEXT,
   last_ts TEXT,
   draft TEXT,
@@ -93,6 +94,9 @@ export function openDb(file = ':memory:') {
   for (const name of ['fit', 'fit_at', 'fit_src', 'scored_by', 'llm_at']) {
     if (!vacCols.includes(name)) db.exec(`ALTER TABLE vacancies ADD COLUMN ${name} TEXT DEFAULT ''`);
   }
+  const chatCols = db.prepare('PRAGMA table_info(chats)').all().map((c) => c.name);
+  if (!chatCols.includes('vacancy_id')) db.exec("ALTER TABLE chats ADD COLUMN vacancy_id TEXT DEFAULT ''");
+  db.exec('CREATE INDEX IF NOT EXISTS idx_chats_vacancy_id ON chats(vacancy_id)');
   return db;
 }
 
@@ -156,8 +160,11 @@ export function snippetFingerprint(text) {
   return `${s.length}:${h.toString(36)}`;
 }
 
-export function listVacancies(db, status, limit = 50) {
-  return db.prepare('SELECT * FROM vacancies WHERE status = ? ORDER BY score DESC, found_at DESC LIMIT ?').all(status, limit);
+export function listVacancies(db, status, limit = 50, { order = 'score' } = {}) {
+  const orderBy = order === 'recent'
+    ? 'substr(found_at, 1, 10) DESC, score DESC, found_at DESC'
+    : 'score DESC, found_at DESC';
+  return db.prepare(`SELECT * FROM vacancies WHERE status = ? ORDER BY ${orderBy} LIMIT ?`).all(status, limit);
 }
 
 export function hasVacancy(db, id) {
@@ -222,16 +229,22 @@ export function countApplicationsSince(db, isoFrom) {
 
 export function upsertChat(db, c) {
   db.prepare(`
-    INSERT INTO chats (id, title, subtitle, vacancy, last_text, last_ts, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO chats (id, title, subtitle, vacancy, vacancy_id, last_text, last_ts, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       title = excluded.title,
       subtitle = excluded.subtitle,
       vacancy = COALESCE(NULLIF(excluded.vacancy, ''), chats.vacancy),
+      vacancy_id = COALESCE(NULLIF(excluded.vacancy_id, ''), chats.vacancy_id),
       last_text = excluded.last_text,
       last_ts = excluded.last_ts,
       updated_at = excluded.updated_at
-  `).run(c.id, c.title ?? '', c.subtitle ?? '', c.vacancy ?? '', c.last ?? '', c.time ?? '', now());
+  `).run(c.id, c.title ?? '', c.subtitle ?? '', c.vacancy ?? '', c.vacancyId ?? '', c.last ?? '', c.time ?? '', now());
+}
+
+export function setChatVacancy(db, chatId, { vacancy = '', vacancyId = '' } = {}) {
+  db.prepare('UPDATE chats SET vacancy = ?, vacancy_id = ?, updated_at = ? WHERE id = ?')
+    .run(vacancy, vacancyId, now(), chatId);
 }
 
 export function setChatDraft(db, chatId, draft) {
@@ -322,6 +335,14 @@ export function purgeLowVacancies(db, isoBefore) {
     WHERE status = 'low' AND found_at < ?
       AND id NOT IN (SELECT vacancy_id FROM applications)
   `).run(isoBefore).changes;
+}
+
+export function archiveStaleNewVacancies(db, isoBefore) {
+  return db.prepare(`
+    UPDATE vacancies
+    SET status = 'stale', updated_at = ?
+    WHERE status = 'new' AND found_at < ?
+  `).run(now(), isoBefore).changes;
 }
 
 export function kvSet(db, k, v) {

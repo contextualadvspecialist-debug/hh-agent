@@ -112,6 +112,39 @@ export function vacancyKeyboard(v, cfg) {
   ];
 }
 
+export function chatReplyKeyboard(cfg, chatId, { hasDraft = true, retryLabel = '🔄 Переписать', kind = 'chat' } = {}) {
+  const base = cfg?.hh?.base || 'https://hh.ru';
+  const chatUrl = `${base}/chat/${chatId}`;
+  if (kind === 'followup') {
+    return [
+      [
+        { text: '📨 Отправить', callback_data: `fu:${chatId}` },
+        { text: retryLabel, callback_data: `redraft:${chatId}:fu` }
+      ],
+      [
+        { text: '🗑 Пропустить', callback_data: `fusk:${chatId}` },
+        { text: '🔗 Открыть чат', url: chatUrl }
+      ]
+    ];
+  }
+  if (!hasDraft) {
+    return [[
+      { text: '🔗 Открыть чат', url: chatUrl },
+      { text: '✅ Уже ответил', callback_data: `cdone:${chatId}` }
+    ]];
+  }
+  return [
+    [
+      { text: '📨 Отправить', callback_data: `send:${chatId}` },
+      { text: retryLabel, callback_data: `redraft:${chatId}` }
+    ],
+    [
+      { text: '✅ Уже ответил', callback_data: `cdone:${chatId}` },
+      { text: '🔗 Открыть чат', url: chatUrl }
+    ]
+  ];
+}
+
 const EXPERIENCE = {
   noExperience: 'без опыта',
   between1And3: '1–3 года',

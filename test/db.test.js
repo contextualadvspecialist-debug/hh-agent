@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import {
-  openDb, upsertVacancy, hasVacancy, setScore, getVacancy,
-  recordApplication, countApplicationsSince, addMessage, listMessages, upsertChat,
+  openDb, closeDb, upsertVacancy, hasVacancy, setScore, getVacancy, listVacancies,
+  recordApplication, countApplicationsSince, addMessage, listMessages, upsertChat, getChat, setChatVacancy,
   setVacancyFit, snippetFingerprint, listRuleScored, getApplication, markApplicationDelivered,
-  setApplicationHhStatus, applicationFunnel, applicationFunnelByQuery, purgeLowVacancies,
+  setApplicationHhStatus, applicationFunnel, applicationFunnelByQuery, purgeLowVacancies, archiveStaleNewVacancies,
   recordChatForm, getChatForm, markChatHandled, getChatHandled, countPendingChatForms
 } from '../src/db.js';
 
@@ -159,6 +160,69 @@ test('внешние анкеты и отметка чата переживаю�
     // Повторное чтение того же сообщения не откатывает submitted обратно в pending.
     recordChatForm(db, { chatId: 'c2', url: 'https://forms.gle/new1', msgExtId: '501', status: 'pending' });
     assert.equal(getChatForm(db, 'c2', 'https://forms.gle/new1')?.status, 'submitted');
+  } finally {
+    db.close();
+  }
+});
+
+test('chats хранит vacancy_id, не затирается каталогом и мигрирует старую БД', async () => {
+  const os = await import('node:os');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const tmpFile = path.join(os.tmpdir(), `hh-agent-mig-${Date.now()}.db`);
+  try {
+    const legacy = new DatabaseSync(tmpFile);
+    legacy.exec(`
+      CREATE TABLE vacancies (id TEXT PRIMARY KEY, title TEXT NOT NULL, company TEXT, salary TEXT, url TEXT, snippet TEXT, query TEXT, score INTEGER DEFAULT 0, reason TEXT, resume TEXT, status TEXT DEFAULT 'new', found_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE applications (id INTEGER PRIMARY KEY AUTOINCREMENT, vacancy_id TEXT NOT NULL UNIQUE, resume_key TEXT, resume_id TEXT, letter TEXT, status TEXT NOT NULL, error TEXT, hh_status TEXT DEFAULT '', hh_status_at TEXT DEFAULT '', applied_at TEXT NOT NULL);
+      CREATE TABLE chats (id TEXT PRIMARY KEY, title TEXT, subtitle TEXT, vacancy TEXT, last_text TEXT, last_ts TEXT, draft TEXT, state TEXT DEFAULT 'new', updated_at TEXT NOT NULL);
+    `);
+    legacy.prepare("INSERT INTO chats (id, title, vacancy, updated_at) VALUES ('c9', 'HR', 'Маркетолог', '2026-01-01T00:00:00.000Z')").run();
+    legacy.close();
+
+    const db = openDb(tmpFile);
+    try {
+      const idx = db.prepare('PRAGMA index_list(chats)').all().map((r) => r.name);
+      assert.ok(idx.includes('idx_chats_vacancy_id'));
+
+      upsertChat(db, { id: 'c9', title: 'HR', vacancy: 'Маркетолог', vacancyId: 'vac-42' });
+      upsertChat(db, { id: 'c9', title: 'HR', vacancy: '', vacancyId: '' });
+      assert.equal(getChat(db, 'c9')?.vacancy_id, 'vac-42');
+
+      setChatVacancy(db, 'c9', { vacancy: 'AI-инженер', vacancyId: 'vac-99' });
+      assert.equal(getChat(db, 'c9')?.vacancy, 'AI-инженер');
+      assert.equal(getChat(db, 'c9')?.vacancy_id, 'vac-99');
+    } finally {
+      closeDb(db);
+    }
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) {
+      try { fs.rmSync(`${tmpFile}${suffix}`, { force: true }); } catch { /* Windows WAL handle delay */ }
+    }
+  }
+});
+
+test('archiveStaleNewVacancies переводит старые new в stale, а order=recent поднимает свежие дни', () => {
+  const db = openDb(':memory:');
+  try {
+    for (const id of ['oldHigh', 'day1Low', 'day2Mid', 'day2Top']) {
+      upsertVacancy(db, { id, title: id, company: 'C', url: 'u', snippet: 's', query: 'q' });
+    }
+    setScore(db, 'oldHigh', { score: 95, reason: 'r', resume: 'ai' });
+    setScore(db, 'day1Low', { score: 60, reason: 'r', resume: 'ai' });
+    setScore(db, 'day2Mid', { score: 70, reason: 'r', resume: 'ai' });
+    setScore(db, 'day2Top', { score: 85, reason: 'r', resume: 'ai' });
+    db.prepare("UPDATE vacancies SET found_at = '2026-01-01T10:00:00.000Z' WHERE id = 'oldHigh'").run();
+    db.prepare("UPDATE vacancies SET found_at = '2026-02-10T12:00:00.000Z' WHERE id = 'day1Low'").run();
+    db.prepare("UPDATE vacancies SET found_at = '2026-02-12T15:00:00.000Z' WHERE id = 'day2Mid'").run();
+    db.prepare("UPDATE vacancies SET found_at = '2026-02-12T09:00:00.000Z' WHERE id = 'day2Top'").run();
+
+    assert.equal(archiveStaleNewVacancies(db, '2026-02-01T00:00:00.000Z'), 1);
+    assert.equal(getVacancy(db, 'oldHigh')?.status, 'stale');
+    assert.equal(hasVacancy(db, 'oldHigh'), true);
+
+    const recent = listVacancies(db, 'new', 10, { order: 'recent' });
+    assert.deepEqual(recent.map((v) => v.id), ['day2Top', 'day2Mid', 'day1Low']);
   } finally {
     db.close();
   }

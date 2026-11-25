@@ -1,7 +1,7 @@
 import { kvGet, kvSet, setChatDraft } from './db.js';
 import { withinWindow, businessDaysBetween } from './schedule.js';
 import { cleanVacancyTitle } from './hh-chats.js';
-import { esc } from './tg.js';
+import { esc, chatReplyKeyboard } from './tg.js';
 
 const SKILL_HINTS = [
   { label: 'LLM и промпт-инжинирингом', re: /\bllm\b|промпт|нейросет|ai-?агент|gpt/i },
@@ -64,17 +64,41 @@ export function findFollowupCandidates(db, { minWorkingDays = 3, limit = 3, now 
       m.direction AS lastDir,
       m.created_at AS lastMsgAt,
       (SELECT COUNT(*) FROM messages mi WHERE mi.chat_id = c.id AND mi.direction = 'in') AS inCount,
-      a.vacancy_id AS vacancyId,
+      COALESCE(NULLIF(c.resolved_vacancy_id, ''), a.vacancy_id) AS vacancyId,
       a.hh_status AS hhStatus,
       a.hh_status_at AS hhStatusAt,
       a.applied_at AS appliedAt,
       v.snippet AS snippet
-    FROM chats c
+    FROM (
+      SELECT
+        chats.*,
+        COALESCE(
+          NULLIF(chats.vacancy_id, ''),
+          (
+            SELECT v1.id
+            FROM vacancies v1
+            WHERE lower(trim(v1.title)) = lower(trim(chats.vacancy))
+              AND lower(trim(v1.company)) = lower(trim(chats.title))
+              AND COALESCE(chats.vacancy, '') <> ''
+            ORDER BY v1.found_at DESC
+            LIMIT 1
+          ),
+          (
+            SELECT v2.id
+            FROM vacancies v2
+            WHERE lower(trim(v2.title)) = lower(trim(chats.vacancy))
+              AND COALESCE(chats.vacancy, '') <> ''
+            ORDER BY v2.found_at DESC
+            LIMIT 1
+          )
+        ) AS resolved_vacancy_id
+      FROM chats
+    ) c
     LEFT JOIN messages m ON m.id = (
       SELECT id FROM messages WHERE chat_id = c.id ORDER BY id DESC LIMIT 1
     )
-    LEFT JOIN vacancies v ON lower(trim(v.title)) = lower(trim(c.vacancy))
-    LEFT JOIN applications a ON a.vacancy_id = v.id
+    LEFT JOIN vacancies v ON v.id = c.resolved_vacancy_id
+    LEFT JOIN applications a ON a.vacancy_id = c.resolved_vacancy_id
     WHERE COALESCE(a.hh_status, '') NOT IN ('rejected', 'invitation', 'hired')
       AND COALESCE(m.direction, 'out') = 'out'
       AND NOT EXISTS (
@@ -113,15 +137,16 @@ export async function proposeFollowups(agent) {
     kvSet(agent.db, `followupDone:${c.chatId}`, `proposed:${new Date().toISOString()}`);
 
     const badge = c.hhStatus === 'viewed' ? '👀 просмотрено' : '⏳ без ответа';
-    await agent.send(
+    const msg = await agent.send(
       `🔔 <b>Follow-up</b> (${badge}, ≥${minDays} раб. дн.)\n`
       + `<b>${esc(c.employer || 'Работодатель')}</b>${c.vacancy ? ` — ${esc(c.vacancy)}` : ''}\n\n`
-      + `<b>Черновик:</b>\n${esc(c.text)}`,
-      [[
-        { text: '📨 Отправить', callback_data: `fu:${c.chatId}` },
-        { text: '🗑 Пропустить', callback_data: `fusk:${c.chatId}` }
-      ]]
+      + `<b>Черновик:</b>\n${esc(c.text)}\n\n`
+      + '<i>Ответьте на это сообщение правкой — перепишу текст.</i>',
+      chatReplyKeyboard(agent.cfg, c.chatId, { hasDraft: true, retryLabel: '🔄 Переписать', kind: 'followup' })
     );
+    if (msg?.message_id) {
+      kvSet(agent.db, `chatMsg:${msg.message_id}`, JSON.stringify({ chatId: String(c.chatId), kind: 'followup' }));
+    }
   }
   return candidates.length;
 }
