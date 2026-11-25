@@ -59,12 +59,22 @@ CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT
 );
+CREATE TABLE IF NOT EXISTS chat_forms (
+  chat_id TEXT NOT NULL,
+  url TEXT NOT NULL,
+  msg_ext_id TEXT DEFAULT '',
+  status TEXT DEFAULT 'pending',
+  notified_at TEXT DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (chat_id, url)
+);
 CREATE INDEX IF NOT EXISTS idx_vac_status ON vacancies(status);
 CREATE INDEX IF NOT EXISTS idx_vac_found_at ON vacancies(found_at);
 CREATE INDEX IF NOT EXISTS idx_vac_score ON vacancies(score);
 CREATE INDEX IF NOT EXISTS idx_app_applied_at ON applications(applied_at);
 CREATE INDEX IF NOT EXISTS idx_app_hh_status ON applications(hh_status);
 CREATE INDEX IF NOT EXISTS idx_msg_chat ON messages(chat_id);
+CREATE INDEX IF NOT EXISTS idx_chat_forms_status ON chat_forms(status);
 `;
 
 export function openDb(file = ':memory:') {
@@ -316,4 +326,64 @@ export function purgeLowVacancies(db, isoBefore) {
 
 export function kvSet(db, k, v) {
   db.prepare('INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(k, String(v));
+}
+
+export function recordChatForm(db, { chatId, url, msgExtId = '', status = 'pending', notifiedAt = '' }) {
+  const ts = now();
+  db.prepare(`
+    INSERT INTO chat_forms (chat_id, url, msg_ext_id, status, notified_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(chat_id, url) DO UPDATE SET
+      msg_ext_id = COALESCE(NULLIF(excluded.msg_ext_id, ''), chat_forms.msg_ext_id),
+      notified_at = COALESCE(NULLIF(chat_forms.notified_at, ''), excluded.notified_at),
+      status = CASE WHEN chat_forms.status = 'submitted' THEN 'submitted' ELSE excluded.status END,
+      updated_at = excluded.updated_at
+  `).run(chatId, url, msgExtId, status, notifiedAt, ts);
+}
+
+export function getChatForm(db, chatId, url) {
+  return db.prepare('SELECT * FROM chat_forms WHERE chat_id = ? AND url = ?').get(chatId, url);
+}
+
+export function getLatestMessageExtId(db, chatId, direction = 'in') {
+  return db.prepare(
+    'SELECT ext_id FROM messages WHERE chat_id = ? AND direction = ? ORDER BY id DESC LIMIT 1'
+  ).get(chatId, direction)?.ext_id ?? '';
+}
+
+export function getChatHandled(db, chatId) {
+  try {
+    const raw = JSON.parse(kvGet(db, `chatHandled:${chatId}`, 'null'));
+    return raw && typeof raw === 'object' ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+export function markChatHandled(db, chatId, { extId = '', state = 'handled' } = {}) {
+  const ts = now();
+  const resolvedExtId = extId || getLatestMessageExtId(db, chatId, 'in');
+  db.prepare('UPDATE chats SET state = ?, draft = ?, updated_at = ? WHERE id = ?')
+    .run(state, '', ts, chatId);
+  if (resolvedExtId) kvSet(db, `notifiedChat:${chatId}`, resolvedExtId);
+  kvSet(db, `chatHandled:${chatId}`, JSON.stringify({ extId: resolvedExtId, state, at: ts }));
+
+  let formsUpdated = 0;
+  if (state === 'form_submitted') {
+    const legacyPrefix = `notifiedForm:${chatId}:`;
+    const legacyForms = db.prepare('SELECT k FROM kv WHERE k LIKE ?').all(`${legacyPrefix}%`);
+    for (const row of legacyForms) {
+      const url = row.k.slice(legacyPrefix.length);
+      if (url) recordChatForm(db, { chatId, url, msgExtId: resolvedExtId, status: 'pending', notifiedAt: ts });
+    }
+    formsUpdated = db.prepare(`
+      UPDATE chat_forms SET status = 'submitted', updated_at = ?
+      WHERE chat_id = ? AND status <> 'submitted'
+    `).run(ts, chatId).changes;
+  }
+  return { extId: resolvedExtId, state, formsUpdated };
+}
+
+export function countPendingChatForms(db) {
+  return db.prepare("SELECT COUNT(*) AS n FROM chat_forms WHERE status = 'pending'").get()?.n ?? 0;
 }

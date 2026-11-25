@@ -4,7 +4,8 @@ import {
   openDb, upsertVacancy, hasVacancy, setScore, getVacancy,
   recordApplication, countApplicationsSince, addMessage, listMessages, upsertChat,
   setVacancyFit, snippetFingerprint, listRuleScored, getApplication, markApplicationDelivered,
-  setApplicationHhStatus, applicationFunnel, applicationFunnelByQuery, purgeLowVacancies
+  setApplicationHhStatus, applicationFunnel, applicationFunnelByQuery, purgeLowVacancies,
+  recordChatForm, getChatForm, markChatHandled, getChatHandled, countPendingChatForms
 } from '../src/db.js';
 
 test('схема создаёт индексы для частых фильтров и сортировок', () => {
@@ -134,6 +135,30 @@ test('повторное чтение исправляет направлени�
     assert.equal(addMessage(db, { chatId: 'c1', extId: '101', direction: 'out', text: 'Вопрос ИИ' }), true);
     assert.equal(addMessage(db, { chatId: 'c1', extId: '101', direction: 'in', text: 'Вопрос ИИ' }), false);
     assert.equal(listMessages(db, 'c1')[0].direction, 'in');
+  } finally {
+    db.close();
+  }
+});
+
+test('внешние анкеты и отметка чата переживают повторную запись и мигрируют из kv', () => {
+  const db = openDb(':memory:');
+  try {
+    upsertChat(db, { id: 'c2', title: 'HR' });
+    addMessage(db, { chatId: 'c2', extId: '501', direction: 'in', text: 'Заполните форму' });
+    db.prepare('INSERT INTO kv (k, v) VALUES (?, ?)').run('notifiedForm:c2:https://forms.gle/legacy1', '1');
+    recordChatForm(db, { chatId: 'c2', url: 'https://forms.gle/new1', msgExtId: '501', status: 'pending' });
+    assert.equal(countPendingChatForms(db), 1);
+
+    const res = markChatHandled(db, 'c2', { state: 'form_submitted' });
+    assert.equal(res.extId, '501');
+    assert.equal(res.formsUpdated, 2);
+    assert.equal(countPendingChatForms(db), 0);
+    assert.equal(getChatForm(db, 'c2', 'https://forms.gle/legacy1')?.status, 'submitted');
+    assert.equal(getChatHandled(db, 'c2')?.extId, '501');
+
+    // Повторное чтение того же сообщения не откатывает submitted обратно в pending.
+    recordChatForm(db, { chatId: 'c2', url: 'https://forms.gle/new1', msgExtId: '501', status: 'pending' });
+    assert.equal(getChatForm(db, 'c2', 'https://forms.gle/new1')?.status, 'submitted');
   } finally {
     db.close();
   }

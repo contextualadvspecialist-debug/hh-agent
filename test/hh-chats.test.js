@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
-import { readChat } from '../src/hh-chats.js';
+import { readChat, extractFormLinks } from '../src/hh-chats.js';
 
 const CHAT_ID = '5784028368';
 const CHAT_URL = `https://spb.hh.ru/chat/${CHAT_ID}`;
@@ -82,4 +82,15 @@ test('readChat отличает входящее AI-сообщение без п
   } finally {
     await browser.close();
   }
+});
+
+test('extractFormLinks распознаёт Google и Яндекс Формы и игнорирует обычные ссылки', () => {
+  const links = extractFormLinks([
+    { text: 'Заполните https://forms.gle/abc123 и https://example.com/about.' },
+    { links: ['https://forms.yandex.ru/u/test/', 'https://hh.ru/vacancy/1'], text: '' }
+  ]);
+  assert.deepEqual(links.sort(), [
+    'https://forms.gle/abc123',
+    'https://forms.yandex.ru/u/test/'
+  ]);
 });

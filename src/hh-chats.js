@@ -71,6 +71,7 @@ function formUrl(value) {
   if (!['http:', 'https:'].includes(url.protocol)) return '';
   if (url.hostname === 'forms.gle') return url.href;
   if (url.hostname === 'docs.google.com' && url.pathname.startsWith('/forms/')) return url.href;
+  if (url.hostname === 'forms.yandex.ru' || url.hostname === 'forms.yandex.com') return url.href;
   return '';
 }
 

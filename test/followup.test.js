@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { openDb, upsertChat, upsertVacancy, recordApplication, addMessage, kvSet } from '../src/db.js';
+import { openDb, upsertChat, upsertVacancy, recordApplication, addMessage, kvSet, recordChatForm, markChatHandled } from '../src/db.js';
 import { buildFollowupText, findFollowupCandidates, workingDaysSince, pickSkill } from '../src/followup.js';
 import { cleanVacancyTitle } from '../src/hh-chats.js';
 
@@ -59,4 +59,21 @@ test('свежая переписка и отказ не попадают в fol
   db.prepare("UPDATE messages SET created_at = '2026-01-05T10:00:00.000Z' WHERE chat_id = 'c2'").run();
 
   assert.equal(findFollowupCandidates(db, { minWorkingDays: 3, now: new Date('2026-01-12T10:00:00.000Z') }).length, 0);
+});
+
+test('чат с незаполненной внешней анкетой не попадает в follow-up до отметки', () => {
+  const db = openDb(':memory:');
+  try {
+    upsertChat(db, { id: 'c3', title: 'HR', vacancy: 'AI-инженер' });
+    addMessage(db, { chatId: 'c3', extId: '30', direction: 'out', text: 'Отклик' });
+    recordChatForm(db, { chatId: 'c3', url: 'https://forms.gle/pending', msgExtId: '29', status: 'pending' });
+    db.prepare("UPDATE messages SET created_at = '2026-01-05T10:00:00.000Z' WHERE chat_id = 'c3'").run();
+
+    assert.equal(findFollowupCandidates(db, { minWorkingDays: 3, now: new Date('2026-01-12T10:00:00.000Z') }).length, 0);
+
+    markChatHandled(db, 'c3', { extId: '29', state: 'form_submitted' });
+    assert.equal(findFollowupCandidates(db, { minWorkingDays: 3, now: new Date('2026-01-12T10:00:00.000Z') }).length, 1);
+  } finally {
+    db.close();
+  }
 });

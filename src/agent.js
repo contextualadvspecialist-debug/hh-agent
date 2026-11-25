@@ -20,7 +20,7 @@ import {
   recentVacancies, setApplicationHhStatus, listApplications, adoptNegotiation, setVacancyFit,
   countVacanciesSince, countApplicationsByHhStatus, snippetFingerprint, listRuleScored,
   markApplicationDelivered, applicationFunnel, applicationFunnelByQuery, purgeLowVacancies,
-  recentSnippets
+  recentSnippets, recordChatForm, getChatForm, markChatHandled, getChatHandled, countPendingChatForms
 } from './db.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -968,40 +968,49 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
         });
       }
 
-      let deliveryFailed = false;
-      for (const url of extractFormLinks(data.messages.filter((m) => m.direction === 'in'))) {
-        const key = `notifiedForm:${c.id}:${url}`;
-        if (kvGet(this.db, key)) continue;
-        const title = data.employer || c.title || 'Чат hh';
-        const sent = await this.send(
-          `📝 <b>Новая анкета</b>\n${esc(title)}\n\nРаботодатель прислал форму для заполнения.`,
-          [[{ text: 'Открыть анкету', url }]]
-        );
-        if (sent) kvSet(this.db, key, '1');
-        else {
-          deliveryFailed = true;
-          this.log(`форма ${c.id}: уведомление не доставлено, повторю`);
+      const lastOut = data.messages.map((m) => m.direction).lastIndexOf('out');
+      if (lastOut >= 0) {
+        const answeredForms = extractFormLinks(data.messages.slice(0, lastOut).filter((m) => m.direction === 'in'));
+        for (const url of answeredForms) {
+          const existing = getChatForm(this.db, c.id, url);
+          if (existing?.status === 'pending') {
+            recordChatForm(this.db, {
+              chatId: c.id,
+              url,
+              msgExtId: existing.msg_ext_id,
+              status: 'submitted',
+              notifiedAt: existing.notified_at
+            });
+          }
         }
       }
-
-      const lastOut = data.messages.map((m) => m.direction).lastIndexOf('out');
       const pending = data.messages.slice(lastOut + 1).filter((m) => m.direction === 'in');
-      if (!pending.length) {
-        if (deliveryFailed) rememberChatRetry(this.db, c, new Error('telegram delivery failed'));
-        continue;
-      }
+      if (!pending.length) continue;
 
       const lastKey = pending[pending.length - 1].extId;
-      const aiPending = pending.some((m) => m.isAi);
-      const notificationKey = aiPending ? `notifiedAiChat:${c.id}` : `notifiedChat:${c.id}`;
-      if (kvGet(this.db, notificationKey) === lastKey) {
-        if (deliveryFailed) rememberChatRetry(this.db, c, new Error('telegram delivery failed'));
-        continue;
-      }
-      pendingCount++;
+      const handled = getChatHandled(this.db, c.id);
+      if (handled?.extId && handled.extId === lastKey) continue;
 
       const chat = getChat(this.db, c.id);
+      if (chat?.state && chat.state !== 'new') {
+        this.db.prepare('UPDATE chats SET state = ?, updated_at = ? WHERE id = ?')
+          .run('new', new Date().toISOString(), c.id);
+      }
+
+      const aiPending = pending.some((m) => m.isAi);
+      const pendingForms = extractFormLinks(pending);
+      for (const url of pendingForms) {
+        recordChatForm(this.db, { chatId: c.id, url, msgExtId: lastKey, status: 'pending' });
+      }
+      const unnotifiedForms = pendingForms.filter((url) => {
+        if (kvGet(this.db, `notifiedForm:${c.id}:${url}`)) return false;
+        return getChatForm(this.db, c.id, url)?.status !== 'submitted';
+      });
+
+      let deliveryFailed = false;
       if (aiPending) {
+        if (kvGet(this.db, `notifiedAiChat:${c.id}`) === lastKey) continue;
+        pendingCount++;
         const quote = pending
           .slice(-3)
           .map((m) => `<i>${esc(m.isAi ? 'ИИ-помощник' : m.author || 'Работодатель')}:</i> ${esc(m.text.slice(0, 600))}`)
@@ -1011,7 +1020,7 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
           `<b>ИИ-помощник в чате</b>\n${esc(title)}${chat?.vacancy ? ` — ${esc(chat.vacancy)}` : ''}\n\n${quote}\n\nАвтоматически отвечать не буду — откройте чат и ответьте вручную.`,
           [[{ text: 'Открыть чат', url: `${this.cfg.hh.base}/chat/${c.id}` }]]
         );
-        if (sent) kvSet(this.db, notificationKey, lastKey);
+        if (sent) kvSet(this.db, `notifiedAiChat:${c.id}`, lastKey);
         else {
           deliveryFailed = true;
           this.log(`chat ${c.id}: уведомление об ИИ-помощнике не доставлено, повторю`);
@@ -1019,6 +1028,58 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
         if (deliveryFailed) rememberChatRetry(this.db, c, new Error('telegram delivery failed'));
         continue;
       }
+
+      if (unnotifiedForms.length) {
+        pendingCount++;
+        const title = chat?.title || data.employer || c.title || 'Чат hh';
+        const vacancy = chat?.vacancy ? ` — ${esc(chat.vacancy)}` : '';
+        const quote = pending
+          .slice(-3)
+          .map((m) => `<i>${esc(m.author || 'Работодатель')}:</i> ${esc(m.text.slice(0, 600))}`)
+          .join('\n');
+        for (const [idx, url] of unnotifiedForms.entries()) {
+          const body = idx === 0
+            ? `📝 <b>Новая анкета</b>\n<b>${esc(title)}</b>${vacancy}\n\n${quote}\n\n<i>После заполнения отметьте кнопкой ниже, чтобы карточка закрылась.</i>`
+            : `📝 <b>Новая анкета</b>\n<b>${esc(title)}</b>${vacancy}\n\nДополнительная форма для заполнения.`;
+          const keyboard = idx === 0
+            ? [
+                [
+                  { text: 'Открыть анкету', url },
+                  { text: '✅ Анкета заполнена', callback_data: `fmdone:${c.id}` }
+                ],
+                [
+                  { text: '✅ Заполнена + написать HR', callback_data: `fmsent:${c.id}` },
+                  { text: '🔗 Открыть чат', url: `${this.cfg.hh.base}/chat/${c.id}` }
+                ]
+              ]
+            : [
+                [
+                  { text: 'Открыть анкету', url },
+                  { text: '✅ Анкета заполнена', callback_data: `fmdone:${c.id}` }
+                ]
+              ];
+          const sent = await this.send(body, keyboard);
+          if (sent) {
+            kvSet(this.db, `notifiedForm:${c.id}:${url}`, '1');
+            recordChatForm(this.db, {
+              chatId: c.id,
+              url,
+              msgExtId: lastKey,
+              status: 'pending',
+              notifiedAt: new Date().toISOString()
+            });
+          } else {
+            deliveryFailed = true;
+            this.log(`форма ${c.id}: уведомление не доставлено, повторю`);
+          }
+        }
+        if (deliveryFailed) rememberChatRetry(this.db, c, new Error('telegram delivery failed'));
+        else kvSet(this.db, `notifiedChat:${c.id}`, lastKey);
+        continue;
+      }
+
+      if (kvGet(this.db, `notifiedChat:${c.id}`) === lastKey) continue;
+      pendingCount++;
 
       let draft = '';
       if (this.llm) {
@@ -1106,6 +1167,7 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
       + countApplicationsByHhStatus(this.db, '');
     const invitations = countApplicationsByHhStatus(this.db, 'invitation');
     const rejected = countApplicationsByHhStatus(this.db, 'rejected');
+    const pendingForms = countPendingChatForms(this.db);
 
     const sent = Boolean(await this.send(
       '📊 <b>Итоги дня</b>\n\n' +
@@ -1114,9 +1176,10 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
       `Ждут ответа: <b>${pending}</b>\n` +
       `Приглашения: <b>${invitations}</b>\n` +
       `Отказы: <b>${rejected}</b>\n` +
+      (pendingForms > 0 ? `Анкеты ждут заполнения: <b>${pendingForms}</b>\n` : '') +
       `В очереди: ${this.queue.length}`
     ));
-    return { found, applied, pending, invitations, rejected, sent };
+    return { found, applied, pending, invitations, rejected, pendingForms, sent };
   }
 
   // Заголовки, которые владелец отклонил кнопкой «Пропустить»: мягкие негативные примеры для llmRefine.
@@ -1272,14 +1335,24 @@ ${history}
       .join('\n');
     const head = `💬 <b>${esc(chat?.title || c.title || 'Чат hh')}</b>${chat?.vacancy ? ` — ${esc(chat.vacancy)}` : ''}`;
     const body = draft ? `${head}\n\n${quote}\n\n<b>Черновик ответа:</b>\n${esc(draft)}` : `${head}\n\n${quote}`;
-    const keyboard = [
-      [
-        draft
-          ? { text: '📨 Отправить', callback_data: `send:${c.id}` }
-          : { text: '🔗 Открыть чат', url: `${this.cfg.hh.base}/chat/${c.id}` },
-        ...(draft ? [{ text: '🔄 Переписать', callback_data: `redraft:${c.id}` }] : [])
-      ]
-    ];
+    const chatUrl = `${this.cfg.hh.base}/chat/${c.id}`;
+    const keyboard = draft
+      ? [
+          [
+            { text: '📨 Отправить', callback_data: `send:${c.id}` },
+            { text: '🔄 Переписать', callback_data: `redraft:${c.id}` }
+          ],
+          [
+            { text: '✅ Уже ответил', callback_data: `cdone:${c.id}` },
+            { text: '🔗 Открыть чат', url: chatUrl }
+          ]
+        ]
+      : [
+          [
+            { text: '🔗 Открыть чат', url: chatUrl },
+            { text: '✅ Уже ответил', callback_data: `cdone:${c.id}` }
+          ]
+        ];
     return this.send(body, keyboard);
   }
 
@@ -1298,8 +1371,37 @@ ${history}
       text: chat.draft,
       ts: new Date().toISOString()
     });
-    setChatDraft(this.db, chatId, '');
+    markChatHandled(this.db, chatId, { state: 'handled' });
     await this.send(`📨 Отправлено в чат <b>${esc(chat.title || chatId)}</b>`);
+  }
+
+  async markFormDone(chatId, { replyInChat = false } = {}) {
+    const chat = getChat(this.db, chatId);
+    const replyText = 'Анкету заполнил, спасибо! Буду рад продолжить общение.';
+    if (replyInChat) {
+      await this.lock('chats', async () => {
+        const page = await this.page('chats');
+        await sendChatMessage(page, this.cfg, chatId, replyText);
+      });
+      addMessage(this.db, {
+        chatId,
+        extId: `local-${Date.now()}`,
+        direction: 'out',
+        author: '',
+        text: replyText,
+        ts: new Date().toISOString()
+      });
+    }
+    const res = markChatHandled(this.db, chatId, { state: 'form_submitted' });
+    this.log(`chat ${chatId}: анкета отмечена как заполненная${replyInChat ? ' (+ ответ отправлен HR)' : ''}`);
+    return { chat, ...res };
+  }
+
+  markChatDone(chatId) {
+    const chat = getChat(this.db, chatId);
+    const res = markChatHandled(this.db, chatId, { state: 'handled' });
+    this.log(`chat ${chatId}: чат отмечен как обработанный`);
+    return { chat, ...res };
   }
 
   async redraft(chatId) {
@@ -1377,6 +1479,24 @@ ${history}
           await this.sendChatReply(a);
         } else if (cmd === 'redraft' && idOk(a)) {
           await this.redraft(a);
+        } else if (cmd === 'fmdone' && idOk(a)) {
+          await this.markFormDone(a, { replyInChat: false });
+          const note = '✅ <b>Анкета отмечена как заполненная.</b>';
+          const baseText = q.message?.text ? `${esc(q.message.text)}\n\n${note}` : note;
+          if (q.message?.message_id && this.tg?.edit) await this.tg.edit(q.message.message_id, baseText, []);
+          else await this.send(note);
+        } else if (cmd === 'fmsent' && idOk(a)) {
+          const r = await this.markFormDone(a, { replyInChat: true });
+          const note = `✅ <b>Анкета отмечена как заполненная</b>, ответ отправлен в чат <b>${esc(r.chat?.title || a)}</b>.`;
+          const baseText = q.message?.text ? `${esc(q.message.text)}\n\n${note}` : note;
+          if (q.message?.message_id && this.tg?.edit) await this.tg.edit(q.message.message_id, baseText, []);
+          else await this.send(note);
+        } else if (cmd === 'cdone' && idOk(a)) {
+          await this.markChatDone(a);
+          const note = '✅ <b>Чат отмечен как обработанный.</b>';
+          const baseText = q.message?.text ? `${esc(q.message.text)}\n\n${note}` : note;
+          if (q.message?.message_id && this.tg?.edit) await this.tg.edit(q.message.message_id, baseText, []);
+          else await this.send(note);
         }
       } catch (e) {
         await this.send(`⚠️ ${esc(e.message.slice(0, 300))}`);

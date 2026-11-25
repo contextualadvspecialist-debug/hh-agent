@@ -77,6 +77,9 @@ export function findFollowupCandidates(db, { minWorkingDays = 3, limit = 3, now 
     LEFT JOIN applications a ON a.vacancy_id = v.id
     WHERE COALESCE(a.hh_status, '') NOT IN ('rejected', 'invitation', 'hired')
       AND COALESCE(m.direction, 'out') = 'out'
+      AND NOT EXISTS (
+        SELECT 1 FROM chat_forms cf WHERE cf.chat_id = c.id AND cf.status = 'pending'
+      )
     ORDER BY COALESCE(NULLIF(a.hh_status_at, ''), m.created_at, c.updated_at) ASC
   `).all();
 

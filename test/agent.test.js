@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Agent, telegramPollBackoffMs } from '../src/agent.js';
-import { openDb, upsertVacancy, listMessages } from '../src/db.js';
+import { openDb, upsertVacancy, listMessages, getChat, getChatForm, countPendingChatForms, recordChatForm, upsertChat, addMessage } from '../src/db.js';
 
 function makeChatPage({ unread = [], all = [], responses = {}, employer = 'Работодатель' } = {}) {
   let mode = 'unread';
@@ -364,6 +364,195 @@ test('checkChatsOnce повторяет чат в следующем опрос�
     assert.equal(delivered.length, 1);
     assert.match(delivered[0], /ООО Тест/);
     assert.match(delivered[0], /Готовы созвониться завтра/);
+  } finally {
+    db.close();
+  }
+});
+
+test('checkChatsOnce склеивает анкету и чат в одну карточку с кнопками отметки и без ИИ-черновика', async () => {
+  const db = openDb(':memory:');
+  const chat = { id: '5802174335', title: 'Роледер Евгений', subtitle: '', last: 'Собеседование', time: '' };
+  const formUrl = 'https://forms.gle/riHEw3BRuNkN1wRY6';
+  const fake = makeChatPage({
+    unread: [chat],
+    all: [chat],
+    employer: chat.title,
+    responses: {
+      [chat.id]: [
+        [{ extId: '101', author: 'Роледер Евгений', direction: 'in', text: `Заполните анкету: ${formUrl}`, ts: '12:53' }],
+        [
+          { extId: '101', author: 'Роледер Евгений', direction: 'in', text: `Заполните анкету: ${formUrl}`, ts: '12:53' },
+          { extId: '102', author: 'Роледер Евгений', direction: 'in', text: 'Когда удобно созвониться?', ts: '15:10' }
+        ]
+      ]
+    }
+  });
+  let draftCalls = 0;
+  let notifyCalls = 0;
+  const sent = [];
+  const edits = [];
+  const agent = {
+    db,
+    cfg: {
+      hh: { base: 'https://spb.hh.ru' },
+      limits: { dailyFollowups: 0, chatsBackfillEveryMinutes: 120, chatsRecentLimit: 20, dailyApplications: 8 }
+    },
+    tg: {
+      chatId: '42',
+      answerCallback: async () => {},
+      edit: async (messageId, text, keyboard) => { edits.push({ messageId, text, keyboard }); }
+    },
+    page: async () => fake.page,
+    lock: async (_, fn) => fn(),
+    refreshChatDirectory: Agent.prototype.refreshChatDirectory,
+    draftReply: async () => { draftCalls++; return 'Черновик'; },
+    notifyChat: async (...args) => { notifyCalls++; return Agent.prototype.notifyChat.apply(agent, args); },
+    markFormDone: Agent.prototype.markFormDone,
+    markChatDone: Agent.prototype.markChatDone,
+    log: () => {},
+    llm: async () => { draftCalls++; return 'Черновик'; },
+    send: async (text, keyboard) => { sent.push({ text, keyboard }); return true; },
+    startOfToday: () => '2026-11-25T00:00:00.000Z',
+    applicationsToday: () => 0,
+    queue: []
+  };
+
+  try {
+    await Agent.prototype.checkChatsOnce.call(agent);
+    assert.equal(sent.length, 1);
+    assert.equal(draftCalls, 0);
+    assert.equal(notifyCalls, 0);
+    assert.match(sent[0].text, /<b>Новая анкета<\/b>/);
+    assert.match(sent[0].text, /Заполните анкету/);
+    assert.deepEqual(sent[0].keyboard.flat().map((b) => b.text), [
+      'Открыть анкету',
+      '✅ Анкета заполнена',
+      '✅ Заполнена + написать HR',
+      '🔗 Открыть чат'
+    ]);
+    assert.equal(countPendingChatForms(db), 1);
+
+    await Agent.prototype.digest.call(agent);
+    assert.match(sent.at(-1).text, /Анкеты ждут заполнения: <b>1<\/b>/);
+
+    // Нажатие «✅ Анкета заполнена» закрывает форму и подавляет повторы по тому же сообщению.
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: {
+        id: 'cb1',
+        data: `fmdone:${chat.id}`,
+        message: { message_id: 77, chat: { id: 42 }, text: 'Карточка анкеты' }
+      }
+    });
+    assert.equal(countPendingChatForms(db), 0);
+    assert.equal(getChatForm(db, chat.id, formUrl)?.status, 'submitted');
+    assert.equal(getChat(db, chat.id)?.state, 'form_submitted');
+    assert.equal(edits.length, 1);
+    assert.match(edits[0].text, /Анкета отмечена как заполненная/);
+    assert.deepEqual(edits[0].keyboard, []);
+
+    fake.setUnread([]);
+    await Agent.prototype.checkChatsOnce.call(agent);
+    assert.equal(notifyCalls, 0);
+
+    // Новое входящее сообщение от HR снова будит чат, но старую форму не дублирует.
+    fake.setUnread([chat]);
+    await Agent.prototype.checkChatsOnce.call(agent);
+    assert.equal(notifyCalls, 1);
+    assert.equal(draftCalls, 1);
+  } finally {
+    db.close();
+  }
+});
+
+test('fmsent отправляет ответ HR, cdone закрывает обычный чат, а ручной out-ответ закрывает анкету', async () => {
+  const db = openDb(':memory:');
+  const chat = { id: '5802174336', title: 'HR Тест', subtitle: '', last: '', time: '' };
+  const sentToHh = [];
+  const fakeChatFrame = {
+    url: () => `https://chatik.hh.ru/chat/${chat.id}`,
+    locator: (sel) => {
+      if (sel.includes('text-input')) {
+        return {
+          last: () => ({
+            waitFor: async () => {},
+            evaluate: async (_, val) => { sentToHh.push(val); },
+            inputValue: async () => ''
+          })
+        };
+      }
+      return {
+        first: () => ({ count: async () => 1, click: async () => {} })
+      };
+    }
+  };
+  const edits = [];
+  const chatPageFake = makeChatPage({
+    unread: [],
+    all: [chat],
+    responses: {
+      [chat.id]: [[
+        { extId: '201', author: 'HR', direction: 'in', text: 'https://forms.gle/answeredEarlier', ts: '10:00' },
+        { extId: '202', author: '', direction: 'out', text: 'Анкету отправил на сайте', ts: '10:15' }
+      ]]
+    }
+  });
+
+  const agent = {
+    db,
+    cfg: {
+      hh: { base: 'https://spb.hh.ru' },
+      limits: { dailyFollowups: 0, chatsBackfillEveryMinutes: 120, chatsRecentLimit: 20 }
+    },
+    tg: {
+      chatId: '42',
+      answerCallback: async () => {},
+      edit: async (messageId, text, keyboard) => { edits.push({ messageId, text, keyboard }); }
+    },
+    page: async () => chatPageFake.page,
+    lock: async (_, fn) => fn(),
+    refreshChatDirectory: Agent.prototype.refreshChatDirectory,
+    markFormDone: Agent.prototype.markFormDone,
+    markChatDone: Agent.prototype.markChatDone,
+    log: () => {},
+    llm: null,
+    send: async () => true
+  };
+
+  try {
+    upsertChat(db, { id: chat.id, title: chat.title });
+    addMessage(db, { chatId: chat.id, extId: '201', direction: 'in', text: 'https://forms.gle/answeredEarlier' });
+    recordChatForm(db, { chatId: chat.id, url: 'https://forms.gle/answeredEarlier', msgExtId: '201', status: 'pending' });
+
+    // Если кандидат ответил прямо на hh.ru после формы, перечитывание снимает статус pending.
+    await Agent.prototype.checkChatsOnce.call(agent);
+    assert.equal(getChatForm(db, chat.id, 'https://forms.gle/answeredEarlier')?.status, 'submitted');
+
+    // Кнопка fmsent отправляет сообщение в чат и помечает анкету закрытой.
+    chatPageFake.page.url = () => `https://spb.hh.ru/chat/${chat.id}`;
+    chatPageFake.page.frames = () => [fakeChatFrame];
+    recordChatForm(db, { chatId: chat.id, url: 'https://forms.gle/secondForm', msgExtId: '203', status: 'pending' });
+    addMessage(db, { chatId: chat.id, extId: '203', direction: 'in', text: 'Ещё анкета' });
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: {
+        id: 'cb2',
+        data: `fmsent:${chat.id}`,
+        message: { message_id: 88, chat: { id: 42 }, text: 'Вторая анкета' }
+      }
+    });
+    assert.equal(sentToHh.length, 1);
+    assert.match(sentToHh[0], /Анкету заполнил/);
+    assert.equal(getChatForm(db, chat.id, 'https://forms.gle/secondForm')?.status, 'submitted');
+
+    // Кнопка cdone помечает обычный чат обработанным.
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: {
+        id: 'cb3',
+        data: `cdone:${chat.id}`,
+        message: { message_id: 89, chat: { id: 42 }, text: 'Чат' }
+      }
+    });
+    assert.equal(getChat(db, chat.id)?.state, 'handled');
+    assert.equal(edits.length, 2);
   } finally {
     db.close();
   }
