@@ -65,6 +65,8 @@ const DEFAULTS = {
     digestHour: 20,
     followupWorkingDays: 3,
     dailyFollowups: 3,
+    alertCooldownHours: 3,
+    pageMaxAgeHours: 6,
     sendWindow: { from: 10, to: 19 }
   },
   threshold: 55,

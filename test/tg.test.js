@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { excerpt, vacancyText, truncateHtml, isOwnerUpdate } from '../src/tg.js';
+import { excerpt, vacancyText, truncateHtml, isOwnerUpdate, MAIN_KEYBOARD } from '../src/tg.js';
 
 test('excerpt режет длинный текст по границе слова', () => {
   const text = `${'слово '.repeat(40)}конец`;
@@ -55,4 +55,11 @@ test('обновления принимаются только из чата в�
   assert.equal(isOwnerUpdate({ callback_query: { message: { chat: { id: 42 } } } }, '42'), true);
   assert.equal(isOwnerUpdate({ callback_query: { id: 'x' } }, '42'), false);
   assert.equal(isOwnerUpdate({ message: { text: '/scan' } }, '42'), false);
+});
+
+test('MAIN_KEYBOARD содержит основные команды меню', () => {
+  const buttons = MAIN_KEYBOARD.flat().map((b) => b.text);
+  for (const cmd of ['/scan', '/direct', '/more', '/chats', '/forms', '/statuses', '/digest', '/stats', '/status', '/blocked', '/help']) {
+    assert.ok(buttons.includes(cmd), `не найдена кнопка ${cmd}`);
+  }
 });

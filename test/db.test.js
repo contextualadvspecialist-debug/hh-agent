@@ -6,7 +6,8 @@ import {
   recordApplication, countApplicationsSince, addMessage, listMessages, upsertChat, getChat, setChatVacancy,
   setVacancyFit, snippetFingerprint, listRuleScored, getApplication, markApplicationDelivered,
   setApplicationHhStatus, applicationFunnel, applicationFunnelByQuery, purgeLowVacancies, archiveStaleNewVacancies,
-  recordChatForm, getChatForm, markChatHandled, getChatHandled, countPendingChatForms, listPendingChatForms
+  recordChatForm, getChatForm, markChatHandled, getChatHandled, countPendingChatForms, listPendingChatForms,
+  countApplicationsByHhStatusSince, countPendingChats, purgeStaleKv, kvGet, kvSet
 } from '../src/db.js';
 
 test('схема создаёт индексы для частых фильтров и сортировок', () => {
@@ -252,6 +253,90 @@ test('listPendingChatForms возвращает только pending с данн
     assert.equal(rows[1].title, 'Alpha HR');
 
     assert.equal(listPendingChatForms(db, 1).length, 1);
+  } finally {
+    db.close();
+  }
+});
+
+test('countApplicationsByHhStatusSince и countPendingChats точно считают статусы и ожидающие чаты', () => {
+  const db = openDb(':memory:');
+  try {
+    upsertVacancy(db, { id: 'v1', title: 'AI', company: 'C', url: 'u', snippet: 's', query: 'q' });
+    upsertVacancy(db, { id: 'v2', title: 'DIR', company: 'C', url: 'u', snippet: 's', query: 'q' });
+    recordApplication(db, { vacancyId: 'v1', resumeKey: 'ai', status: 'applied' });
+    recordApplication(db, { vacancyId: 'v2', resumeKey: 'direct', status: 'applied' });
+    setApplicationHhStatus(db, 'v1', 'invitation');
+    setApplicationHhStatus(db, 'v2', 'invitation');
+    db.prepare("UPDATE applications SET hh_status_at = '2026-01-01T10:00:00.000Z' WHERE vacancy_id = 'v1'").run();
+    db.prepare("UPDATE applications SET hh_status_at = '2026-02-02T12:00:00.000Z' WHERE vacancy_id = 'v2'").run();
+    assert.equal(countApplicationsByHhStatusSince(db, 'invitation', '2026-02-02T00:00:00.000Z'), 1);
+
+    // c1 — новое входящее (ожидает ответа); c2 — исходящее; c3 — handled; c4 — ждёт внешнюю анкету.
+    upsertChat(db, { id: 'c1', title: 'HR 1' });
+    addMessage(db, { chatId: 'c1', extId: '1', direction: 'in', text: 'Привет' });
+
+    upsertChat(db, { id: 'c2', title: 'HR 2' });
+    addMessage(db, { chatId: 'c2', extId: '1', direction: 'in', text: 'Привет' });
+    addMessage(db, { chatId: 'c2', extId: '2', direction: 'out', text: 'Ответил' });
+
+    upsertChat(db, { id: 'c3', title: 'HR 3' });
+    addMessage(db, { chatId: 'c3', extId: '1', direction: 'in', text: 'Ждём' });
+    markChatHandled(db, 'c3', { extId: '1', state: 'handled' });
+
+    upsertChat(db, { id: 'c4', title: 'HR 4' });
+    addMessage(db, { chatId: 'c4', extId: '1', direction: 'in', text: 'Анкета' });
+    recordChatForm(db, { chatId: 'c4', url: 'https://tally.so/r/abc', status: 'pending' });
+
+    assert.equal(countPendingChats(db), 1);
+  } finally {
+    db.close();
+  }
+});
+
+test('purgeStaleKv удаляет одноразовые и протухшие ключи, не трогая дедупликацию и свежие черновики', () => {
+  const db = openDb(':memory:');
+  try {
+    const nowMs = Date.parse('2026-11-25T15:00:00.000Z');
+    const oldMs = nowMs - 20 * 86400_000;
+    const recentMs = nowMs - 2 * 3600_000;
+
+    upsertVacancy(db, { id: '9001', title: 'Applied', company: 'C', url: 'u', snippet: 's', query: 'q' });
+    db.prepare("UPDATE vacancies SET status = 'applied' WHERE id = '9001'").run();
+
+    kvSet(db, 'chatDir:2026-11-23', '1');
+    kvSet(db, 'chatDir:2026-11-25', '1');
+    kvSet(db, 'followupCount:2026-11-24', '2');
+    kvSet(db, 'followupCount:2026-11-25', '1');
+    kvSet(db, 'letterDraft:old', JSON.stringify({ letter: 'x', at: nowMs - 72 * 3600_000 }));
+    kvSet(db, 'letterDraft:fresh', JSON.stringify({ letter: 'y', at: recentMs }));
+    kvSet(db, 'answers:old', JSON.stringify({ answers: ['a'], at: nowMs - 72 * 3600_000 }));
+    kvSet(db, 'letterMsg:10', JSON.stringify({ vacancyId: '1', at: oldMs }));
+    kvSet(db, 'letterMsg:11', JSON.stringify({ vacancyId: '9001' }));
+    kvSet(db, 'letterMsg:12', JSON.stringify({ vacancyId: '12', at: recentMs }));
+    kvSet(db, 'chatMsg:20', JSON.stringify({ chatId: 'c1', at: oldMs }));
+    kvSet(db, 'chatMsg:21', JSON.stringify({ chatId: 'c1', at: recentMs }));
+    kvSet(db, 'tgOffset', '100');
+    kvSet(db, 'notifiedChat:c1', 'm1');
+    kvSet(db, 'followupDone:c1', 'sent');
+
+    const removed = purgeStaleKv(db, { todayKey: '2026-11-25', nowMs });
+    assert.equal(removed, 7);
+
+    assert.equal(kvGet(db, 'chatDir:2026-11-23'), null);
+    assert.equal(kvGet(db, 'chatDir:2026-11-25'), '1');
+    assert.equal(kvGet(db, 'followupCount:2026-11-24'), null);
+    assert.equal(kvGet(db, 'followupCount:2026-11-25'), '1');
+    assert.equal(kvGet(db, 'letterDraft:old'), null);
+    assert.equal(kvGet(db, 'answers:old'), null);
+    assert.ok(kvGet(db, 'letterDraft:fresh'));
+    assert.equal(kvGet(db, 'letterMsg:10'), null);
+    assert.equal(kvGet(db, 'letterMsg:11'), null);
+    assert.ok(kvGet(db, 'letterMsg:12'));
+    assert.equal(kvGet(db, 'chatMsg:20'), null);
+    assert.ok(kvGet(db, 'chatMsg:21'));
+    assert.equal(kvGet(db, 'tgOffset'), '100');
+    assert.equal(kvGet(db, 'notifiedChat:c1'), 'm1');
+    assert.equal(kvGet(db, 'followupDone:c1'), 'sent');
   } finally {
     db.close();
   }

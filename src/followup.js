@@ -145,7 +145,7 @@ export async function proposeFollowups(agent) {
       chatReplyKeyboard(agent.cfg, c.chatId, { hasDraft: true, retryLabel: '🔄 Переписать', kind: 'followup' })
     );
     if (msg?.message_id) {
-      kvSet(agent.db, `chatMsg:${msg.message_id}`, JSON.stringify({ chatId: String(c.chatId), kind: 'followup' }));
+      kvSet(agent.db, `chatMsg:${msg.message_id}`, JSON.stringify({ chatId: String(c.chatId), kind: 'followup', at: Date.now() }));
     }
   }
   return candidates.length;

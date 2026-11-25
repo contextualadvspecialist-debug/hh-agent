@@ -129,7 +129,9 @@ test('proposeFollowups сохраняет chatMsg для правки репла
       'fu:c10', 'redraft:c10:fu', 'fusk:c10', 'https://spb.hh.ru/chat/c10'
     ]);
     const ref = JSON.parse(db.prepare("SELECT v FROM kv WHERE k = 'chatMsg:555'").get().v);
-    assert.deepEqual(ref, { chatId: 'c10', kind: 'followup' });
+    assert.equal(ref.chatId, 'c10');
+    assert.equal(ref.kind, 'followup');
+    assert.equal(typeof ref.at, 'number');
   } finally {
     db.close();
   }

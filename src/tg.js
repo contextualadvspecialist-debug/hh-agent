@@ -87,9 +87,9 @@ export class Telegram {
 
 // Текст кнопки совпадает с командой — нажатие отправляет её боту.
 export const MAIN_KEYBOARD = [
-  [{ text: '/scan' }, { text: '/direct' }],
-  [{ text: '/chats' }, { text: '/statuses' }],
-  [{ text: '/digest' }, { text: '/status' }],
+  [{ text: '/scan' }, { text: '/direct' }, { text: '/more' }],
+  [{ text: '/chats' }, { text: '/forms' }, { text: '/statuses' }],
+  [{ text: '/digest' }, { text: '/stats' }, { text: '/status' }],
   [{ text: '/blocked' }, { text: '/help' }]
 ];
 

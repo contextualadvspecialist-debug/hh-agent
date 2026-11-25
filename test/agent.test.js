@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Agent, telegramPollBackoffMs } from '../src/agent.js';
 import { AuthError } from '../src/browser.js';
-import { openDb, upsertVacancy, listMessages, getChat, getChatForm, countPendingChatForms, recordChatForm, upsertChat, addMessage, recordApplication, setScore, setVacancyStatus, getVacancy, kvGet, kvSet } from '../src/db.js';
+import { openDb, upsertVacancy, listMessages, getChat, getChatForm, countPendingChatForms, recordChatForm, upsertChat, addMessage, recordApplication, setApplicationHhStatus, setScore, setVacancyStatus, getVacancy, kvGet, kvSet } from '../src/db.js';
 
 function makeChatPage({ unread = [], all = [], responses = {}, employer = 'Работодатель' } = {}) {
   let mode = 'unread';
@@ -1022,5 +1022,175 @@ test('runScheduledTask троттлит алерты о потере логин�
     assert.match(sent[4], /Сбой планировщика \(скан вакансий\).*3 ошибок подряд/);
   } finally {
     db.close();
+  }
+});
+
+test('/digest делит сегодня/воронку, /stats считает конверсию, а /status управляет очередью', async () => {
+  const db = openDb(':memory:');
+  const sent = [];
+  const edits = [];
+  const agent = {
+    db,
+    cfg: {
+      hh: { base: 'https://spb.hh.ru' },
+      limits: { dailyApplications: 8, sendWindow: { from: 0, to: 24 } }
+    },
+    queue: [
+      { vacancyId: '101', resumeKey: 'ai', letterText: 'L1' },
+      { vacancyId: '102', resumeKey: 'direct', letterText: 'L2' }
+    ],
+    schedulerErrors: { scan: 1, chats: 0, status: 0 },
+    tg: {
+      chatId: '42',
+      async answerCallback() {},
+      async edit(messageId, text, keyboard) { edits.push({ messageId, text, keyboard }); }
+    },
+    startOfToday: Agent.prototype.startOfToday,
+    applicationsToday: Agent.prototype.applicationsToday,
+    saveQueue: Agent.prototype.saveQueue,
+    digest: Agent.prototype.digest,
+    statsText: Agent.prototype.statsText,
+    send: async (text, keyboard) => { sent.push({ text, keyboard }); return { message_id: sent.length }; },
+    log: () => {}
+  };
+
+  try {
+    upsertVacancy(db, { id: '101', title: 'AI-разработчик', company: 'Альфа', url: 'u1', snippet: 's', query: 'AI' });
+    upsertVacancy(db, { id: '102', title: 'Директолог', company: 'Бета', url: 'u2', snippet: 's', query: 'Директ' });
+    upsertVacancy(db, { id: '103', title: 'Old Invite', company: 'Гамма', url: 'u3', snippet: 's', query: 'AI' });
+    upsertVacancy(db, { id: '104', title: 'Today Viewed', company: 'Дельта', url: 'u4', snippet: 's', query: 'AI' });
+    upsertVacancy(db, { id: '105', title: 'Today Invite', company: 'Эпсилон', url: 'u5', snippet: 's', query: 'AI' });
+
+    recordApplication(db, { vacancyId: '103', resumeKey: 'ai', status: 'applied' });
+    recordApplication(db, { vacancyId: '104', resumeKey: 'ai', status: 'applied' });
+    recordApplication(db, { vacancyId: '105', resumeKey: 'ai', status: 'applied' });
+    setApplicationHhStatus(db, '103', 'invitation');
+    setApplicationHhStatus(db, '104', 'viewed');
+    setApplicationHhStatus(db, '105', 'invitation');
+    db.prepare("UPDATE applications SET applied_at = '2020-01-01T10:00:00.000Z', hh_status_at = '2020-01-02T10:00:00.000Z' WHERE vacancy_id = '103'").run();
+
+    upsertChat(db, { id: 'chat1', title: 'HR Chat' });
+    addMessage(db, { chatId: 'chat1', extId: 'm1', direction: 'in', text: 'Ответьте' });
+    kvSet(db, 'lastScan', new Date(Date.now() - 10 * 60_000).toISOString());
+    kvSet(db, 'lastChatsCheck', new Date(Date.now() - 2 * 60_000).toISOString());
+
+    const digest = await agent.digest();
+    assert.equal(digest.invitationsToday, 1);
+    assert.equal(digest.invitations, 2);
+    assert.equal(digest.pendingChats, 1);
+    assert.match(sent[0].text, /<b>За сегодня<\/b>/);
+    assert.match(sent[0].text, /<b>Всего в воронке<\/b>/);
+    assert.match(sent[0].text, /Новых приглашений: <b>1<\/b>/);
+    assert.match(sent[0].text, /Приглашения: <b>2<\/b>/);
+    assert.match(sent[0].text, /Чаты ждут ответа: <b>1<\/b>/);
+
+    const stats = agent.statsText();
+    assert.match(stats, /Всего: <b>3<\/b> · просмотр <b>3<\/b> \(100%\) · приглашение <b>2<\/b> \(67%\)/);
+    assert.match(stats, /AI-резюме: 3 откл\. · просмотр 3 \(100%\) · приглашение 2 \(67%\)/);
+
+    await Agent.prototype.handleUpdate.call(agent, { message: { chat: { id: 42 }, text: '/status' } });
+    const statusMsg = sent.at(-1);
+    assert.match(statusMsg.text, /Ожидают ответа: чаты <b>1<\/b> · анкеты <b>0<\/b>/);
+    assert.match(statusMsg.text, /Проверки: скан .*мин назад\) · чаты .* · статусы не было/);
+    assert.match(statusMsg.text, /AI-разработчик — Альфа/);
+    assert.match(statusMsg.text, /Директолог — Бета/);
+    assert.deepEqual(statusMsg.keyboard.flat().map((b) => b.callback_data), ['qdrop:101', 'qdrop:102', 'qclear']);
+
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: { id: 'cb_drop', data: 'qdrop:101', message: { message_id: 55, chat: { id: 42 }, text: 'old' } }
+    });
+    assert.deepEqual(agent.queue.map((j) => j.vacancyId), ['102']);
+    assert.match(edits.at(-1).text, /Убрано из очереди.*101/);
+    assert.match(edits.at(-1).text, /Директолог — Бета/);
+    assert.equal(edits.at(-1).keyboard.flat().some((b) => b.callback_data === 'qdrop:102'), true);
+
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: { id: 'cb_clear', data: 'qclear', message: { message_id: 55, chat: { id: 42 }, text: 'old' } }
+    });
+    assert.equal(agent.queue.length, 0);
+    assert.match(edits.at(-1).text, /Очередь очищена.*удалено 1/);
+    assert.match(edits.at(-1).text, /Очередь откликов пуста/);
+  } finally {
+    db.close();
+  }
+});
+
+test('maintenance и acquirePage чистят kv и ротируют устаревшие вкладки без срыва активного отклика', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { acquirePage } = await import('../src/agent-ops.js');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hh-maint-'));
+  const db = openDb(':memory:');
+  const closed = [];
+  const opened = [];
+  const fakeCtx = {
+    on() {},
+    async newPage() {
+      const p = {
+        closed: false,
+        url: () => 'https://spb.hh.ru/',
+        isClosed() { return this.closed; },
+        setDefaultTimeout() {},
+        setDefaultNavigationTimeout() {},
+        async close() { this.closed = true; }
+      };
+      opened.push(p);
+      return p;
+    }
+  };
+  const agent = {
+    db,
+    cfg: {
+      paths: { root: tmp },
+      limits: { pageMaxAgeHours: 6 }
+    },
+    ctx: fakeCtx,
+    pages: {
+      chats: {
+        closed: false,
+        url: () => 'https://chatik.hh.ru/',
+        isClosed() { return this.closed; },
+        async close() { this.closed = true; closed.push('chats'); }
+      },
+      apply: {
+        closed: false,
+        url: () => 'https://spb.hh.ru/applicant/vacancy_response?vacancyId=1',
+        isClosed() { return this.closed; },
+        async close() { this.closed = true; closed.push('apply'); }
+      }
+    },
+    pageCreatedAt: {
+      chats: Date.now() - 7 * 3600_000,
+      apply: Date.now() - 2 * 3600_000
+    },
+    lock: Agent.prototype.lock,
+    log: () => {}
+  };
+
+  try {
+    kvSet(db, 'chatDir:2020-01-01', '1');
+    kvSet(db, 'letterDraft:stale', JSON.stringify({ letter: 'x', at: 1000 }));
+    kvSet(db, 'tgOffset', '77');
+
+    // acquirePage пересоздаёт старую вкладку chats, но возвращает объект.
+    const freshChats = await acquirePage(agent, 'chats');
+    assert.deepEqual(closed, ['chats']);
+    assert.equal(opened.length, 1);
+    assert.equal(agent.pages.chats, freshChats);
+
+    // maintenance ночью закрывает chats, но не трогает apply, пока там открыта анкета vacancy_response моложе 12ч.
+    const res = await Agent.prototype.maintenance.call(agent);
+    assert.equal(res.backup, 'сделан');
+    assert.equal(res.kvPurged, 2);
+    assert.equal(res.pagesRecycled, 1);
+    assert.equal(agent.pages.chats, undefined);
+    assert.ok(agent.pages.apply);
+    assert.equal(kvGet(db, 'tgOffset'), '77');
+    assert.ok(kvGet(db, 'lastMaintenanceAt'));
+  } finally {
+    db.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

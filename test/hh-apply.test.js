@@ -5,7 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { chromium } from 'playwright-core';
 import { AuthError } from '../src/browser.js';
-import { readResponseQuestions, fillResponseAnswers, applyToVacancy } from '../src/hh-apply.js';
+import { readResponseQuestions, fillResponseAnswers, submitResponseForm, applyToVacancy } from '../src/hh-apply.js';
 
 const FORM_URL = 'https://spb.hh.ru/applicant/vacancy_response?vacancyId=777123';
 
@@ -171,5 +171,104 @@ test('applyToVacancy возвращает questions даже с кнопкой s
   } finally {
     await browser.close();
     fs.rmSync(lettersDir, { recursive: true, force: true });
+  }
+});
+
+test('checkbox с запятой в названии и одиночный checkbox заполняются корректно', async () => {
+  const html = `<!doctype html>
+  <html lang="ru"><body><main><form action="/applicant/vacancy_response">
+    <div data-qa="vacancy-response-popup">
+      <div data-qa="q-comma" role="group">
+        <div>Какие связки настраивали?</div>
+        <label><input type="checkbox" name="stack" value="ads" /><span>Яндекс Директ, Telegram Ads</span></label>
+        <label><input type="checkbox" name="stack" value="seo" /><span>SEO</span></label>
+      </div>
+      <div data-qa="q-agree">
+        <div>Согласие на тестовое</div>
+        <label><input type="checkbox" name="agree" value="yes" /><span>Да, готов</span></label>
+      </div>
+    </div>
+  </form></main></body></html>`;
+
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.route((u) => u.href.startsWith(FORM_URL), (route) => route.fulfill({
+      contentType: 'text/html; charset=utf-8',
+      body: html
+    }));
+    await page.goto(FORM_URL, { waitUntil: 'domcontentloaded' });
+    const questions = await readResponseQuestions(page);
+    assert.equal(questions.length, 2);
+    assert.deepEqual(questions[0].options, ['Яндекс Директ, Telegram Ads', 'SEO']);
+
+    const res = await fillResponseAnswers(page, ['Яндекс Директ, Telegram Ads', 'Да']);
+    assert.deepEqual(res, { ok: true, count: 2 });
+    assert.equal(await page.locator('input[name="stack"][value="ads"]').isChecked(), true);
+    assert.equal(await page.locator('input[name="stack"][value="seo"]').isChecked(), false);
+    assert.equal(await page.locator('input[name="agree"]').isChecked(), true);
+
+    const unchecked = await fillResponseAnswers(page, ['SEO', 'Нет']);
+    assert.deepEqual(unchecked, { ok: true, count: 2 });
+    assert.equal(await page.locator('input[name="stack"][value="seo"]').isChecked(), true);
+    assert.equal(await page.locator('input[name="agree"]').isChecked(), false);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('applyToVacancy обрабатывает applied, already, closed, alert-ошибку и submitResponseForm', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const page = await browser.newPage();
+    let mode = 'apply_ok';
+
+    await page.route((u) => u.href.startsWith(FORM_URL), (route) => {
+      if (mode === 'already') {
+        return route.fulfill({ contentType: 'text/html; charset=utf-8', body: '<html><body><p>Вы откликнулись на эту вакансию</p></body></html>' });
+      }
+      if (mode === 'closed') {
+        return route.fulfill({ contentType: 'text/html; charset=utf-8', body: '<html><body><p>Вакансия в архиве</p></body></html>' });
+      }
+      const afterSubmitHtml = mode === 'alert_err'
+        ? 'document.body.insertAdjacentHTML("beforeend", "<div role=\\"alert\\">Обязательное поле</div>");'
+        : 'document.body.innerHTML = "<p>Отклик отправлен</p>";';
+      return route.fulfill({
+        contentType: 'text/html; charset=utf-8',
+        body: `<!doctype html><html lang="ru"><body><main>
+          <div data-qa="resume-title">AI-инженер</div>
+          <button type="button" data-qa="add-cover-letter" onclick="document.getElementById('let').hidden=false">Добавить письмо</button>
+          <textarea id="let" name="letter" hidden></textarea>
+          <button type="button" data-qa="vacancy-response-submit-popup" onclick='${afterSubmitHtml}'>Откликнуться</button>
+        </main></body></html>`
+      });
+    });
+
+    const cfg = {
+      hh: { base: 'https://spb.hh.ru' },
+      resumes: { ai: { title: 'AI' } }
+    };
+    const vacancy = { id: '777123', url: 'https://spb.hh.ru/vacancy/777123' };
+
+    const ok = await applyToVacancy(page, cfg, vacancy, 'ai', 'Сопроводительное письмо');
+    assert.deepEqual(ok, { status: 'applied', resume: 'AI-инженер' });
+
+    mode = 'alert_err';
+    const manual = await applyToVacancy(page, cfg, vacancy, 'ai', 'Письмо');
+    assert.equal(manual.status, 'manual');
+    assert.match(manual.reason, /Обязательное поле/);
+
+    mode = 'apply_ok';
+    await page.goto(FORM_URL, { waitUntil: 'domcontentloaded' });
+    const submitted = await submitResponseForm(page);
+    assert.deepEqual(submitted, { status: 'applied' });
+
+    mode = 'already';
+    assert.deepEqual(await applyToVacancy(page, cfg, vacancy, 'ai', 'Письмо'), { status: 'already' });
+
+    mode = 'closed';
+    assert.deepEqual(await applyToVacancy(page, cfg, vacancy, 'ai', 'Письмо'), { status: 'closed' });
+  } finally {
+    await browser.close();
   }
 });

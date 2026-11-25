@@ -307,16 +307,23 @@ export function countApplicationsByHhStatus(db, status) {
   return db.prepare('SELECT COUNT(*) AS n FROM applications WHERE hh_status = ?').get(status)?.n ?? 0;
 }
 
+export function countApplicationsByHhStatusSince(db, status, isoFrom) {
+  return db.prepare('SELECT COUNT(*) AS n FROM applications WHERE hh_status = ? AND hh_status_at >= ?')
+    .get(status, isoFrom)?.n ?? 0;
+}
+
 export function kvGet(db, k, fallback = null) {
   const row = db.prepare('SELECT v FROM kv WHERE k = ?').get(k);
   return row ? row.v : fallback;
 }
 
-// Воронка откликов в разрезе резюме и поискового запроса: без ручных выборок в агенте.
+// Воронка откликов в разрезе резюме и поискового запроса: только доставленные/подтверждённые отклики.
 export function applicationFunnel(db) {
   return db.prepare(`
     SELECT COALESCE(NULLIF(resume_key, ''), '—') AS key, hh_status AS status, COUNT(*) AS n
-    FROM applications GROUP BY 1, 2
+    FROM applications
+    WHERE status IN ('applied', 'already', 'imported') OR COALESCE(hh_status, '') <> ''
+    GROUP BY 1, 2
   `).all();
 }
 
@@ -325,6 +332,7 @@ export function applicationFunnelByQuery(db) {
     SELECT COALESCE(NULLIF(v.query, ''), '—') AS key, a.hh_status AS status, COUNT(*) AS n
     FROM applications a
     LEFT JOIN vacancies v ON v.id = a.vacancy_id
+    WHERE a.status IN ('applied', 'already', 'imported') OR COALESCE(a.hh_status, '') <> ''
     GROUP BY 1, 2
   `).all();
 }
@@ -427,4 +435,95 @@ export function listPendingChatForms(db, limit = 20) {
     ORDER BY COALESCE(NULLIF(cf.notified_at, ''), cf.updated_at) DESC, cf.updated_at DESC
     LIMIT ?
   `).all(limit);
+}
+
+// Чаты с неотвеченным входящим сообщением (исключаем уже закрытые и ожидающие внешнюю анкету).
+export function countPendingChats(db) {
+  return db.prepare(`
+    SELECT COUNT(*) AS n
+    FROM chats c
+    JOIN messages m ON m.id = (SELECT id FROM messages WHERE chat_id = c.id ORDER BY id DESC LIMIT 1)
+    WHERE COALESCE(c.state, 'new') = 'new'
+      AND m.direction = 'in'
+      AND NOT EXISTS (
+        SELECT 1 FROM chat_forms cf WHERE cf.chat_id = c.id AND cf.status = 'pending'
+      )
+  `).get()?.n ?? 0;
+}
+
+const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const TERMINAL_VACANCY_STATUSES = new Set(['applied', 'skipped', 'closed', 'stale', 'low']);
+
+// Чистим только одноразовые/устаревшие kv-ключи; маркеры дедупликации (notified*, chatHandled*, followupDone*) сохраняем.
+export function purgeStaleKv(
+  db,
+  {
+    todayKey = (() => {
+      const d = new Date();
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    })(),
+    nowMs = Date.now(),
+    maxDraftAgeMs = 48 * 3600_000,
+    maxMsgRefAgeMs = 14 * 86400_000,
+    maxLegacyMsgRefs = 200
+  } = {}
+) {
+  const toDelete = [];
+
+  for (const row of db.prepare("SELECT k FROM kv WHERE k LIKE 'chatDir:%' OR k LIKE 'followupCount:%'").all()) {
+    const day = row.k.split(':').slice(1).join(':');
+    if (DAY_KEY_RE.test(day) && day < todayKey) toDelete.push(row.k);
+  }
+
+  for (const row of db.prepare("SELECT k, v FROM kv WHERE k LIKE 'letterDraft:%' OR k LIKE 'answers:%'").all()) {
+    let parsed = null;
+    try { parsed = JSON.parse(row.v); } catch { /* битый JSON удаляем */ }
+    const at = Number(parsed?.at);
+    if (!parsed || typeof parsed !== 'object' || !Number.isFinite(at) || nowMs - at > maxDraftAgeMs) {
+      toDelete.push(row.k);
+    }
+  }
+
+  const collectMsgRefs = (prefix, checkVacancy) => {
+    const rows = db.prepare('SELECT k, v FROM kv WHERE k LIKE ?').all(`${prefix}%`);
+    const legacy = [];
+    for (const row of rows) {
+      let parsed = null;
+      try { parsed = JSON.parse(row.v); } catch { /* битую ссылку удаляем */ }
+      if (!parsed || typeof parsed !== 'object') {
+        toDelete.push(row.k);
+        continue;
+      }
+      const at = Number(parsed.at);
+      if (Number.isFinite(at)) {
+        if (nowMs - at > maxMsgRefAgeMs) toDelete.push(row.k);
+        continue;
+      }
+      if (checkVacancy && parsed.vacancyId) {
+        const vac = getVacancy(db, String(parsed.vacancyId));
+        if (vac && TERMINAL_VACANCY_STATUSES.has(vac.status)) {
+          toDelete.push(row.k);
+          continue;
+        }
+      }
+      legacy.push({ k: row.k, msgId: Number(row.k.slice(prefix.length)) || 0 });
+    }
+    legacy.sort((a, b) => b.msgId - a.msgId);
+    for (const item of legacy.slice(maxLegacyMsgRefs)) toDelete.push(item.k);
+  };
+
+  collectMsgRefs('letterMsg:', true);
+  collectMsgRefs('chatMsg:', false);
+
+  if (!toDelete.length) return 0;
+  const del = db.prepare('DELETE FROM kv WHERE k = ?');
+  db.exec('BEGIN');
+  try {
+    for (const key of toDelete) del.run(key);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return toDelete.length;
 }
