@@ -408,3 +408,23 @@ export function markChatHandled(db, chatId, { extId = '', state = 'handled' } = 
 export function countPendingChatForms(db) {
   return db.prepare("SELECT COUNT(*) AS n FROM chat_forms WHERE status = 'pending'").get()?.n ?? 0;
 }
+
+export function listPendingChatForms(db, limit = 20) {
+  return db.prepare(`
+    SELECT
+      cf.chat_id,
+      cf.url,
+      cf.msg_ext_id,
+      cf.status,
+      cf.notified_at,
+      cf.updated_at,
+      COALESCE(NULLIF(c.title, ''), cf.chat_id) AS title,
+      COALESCE(c.vacancy, '') AS vacancy,
+      COALESCE(c.vacancy_id, '') AS vacancy_id
+    FROM chat_forms cf
+    LEFT JOIN chats c ON c.id = cf.chat_id
+    WHERE cf.status = 'pending'
+    ORDER BY COALESCE(NULLIF(cf.notified_at, ''), cf.updated_at) DESC, cf.updated_at DESC
+    LIMIT ?
+  `).all(limit);
+}

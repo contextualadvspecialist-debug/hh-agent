@@ -1,3 +1,5 @@
+import { assertLoggedIn } from './browser.js';
+
 const CHAT_FRAME = /chatik\.hh\.ru\/chat\//;
 const URL_PATTERN = /\bhttps?:\/\/[^\s<>"']+/gi;
 
@@ -26,9 +28,13 @@ async function chatFrame(page, timeoutMs = 20000) {
 export async function listUnreadChats(page, cfg, { onlyUnread = true } = {}) {
   await page.goto(`${cfg.hh.base}/chat`, { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(3000);
+  await assertLoggedIn(page, 'сессия hh.ru истекла (чаты)');
 
   const firstChat = page.locator('a[data-qa^="chatik-open-chat-"]').first();
   await firstChat.waitFor({ timeout: 15000 }).catch(() => {});
+  if (!(await firstChat.count().catch(() => 0))) {
+    await assertLoggedIn(page, 'сессия hh.ru истекла (чаты)');
+  }
 
   const unread = page.locator('[data-qa="chatik-checkbox-only-unread"]').first();
   if (await unread.count()) {
@@ -61,7 +67,7 @@ export function listAllChats(page, cfg) {
   return listUnreadChats(page, cfg, { onlyUnread: false });
 }
 
-function formUrl(value) {
+export function formUrl(value) {
   let url;
   try {
     url = new URL(String(value ?? '').trim().replace(/[.,!?;:)\]}]+$/, ''));
@@ -69,9 +75,19 @@ function formUrl(value) {
     return '';
   }
   if (!['http:', 'https:'].includes(url.protocol)) return '';
-  if (url.hostname === 'forms.gle') return url.href;
-  if (url.hostname === 'docs.google.com' && url.pathname.startsWith('/forms/')) return url.href;
-  if (url.hostname === 'forms.yandex.ru' || url.hostname === 'forms.yandex.com') return url.href;
+  const host = url.hostname.toLowerCase().replace(/^www\./, '');
+  const path = url.pathname || '/';
+
+  if (host === 'forms.gle') return url.href;
+  if (host === 'docs.google.com' && path.startsWith('/forms/')) return url.href;
+  if (host === 'forms.yandex.ru' || host === 'forms.yandex.com') return url.href;
+  if ((host === 'tally.so' || host.endsWith('.tally.so')) && path.length > 1) return url.href;
+  if ((host === 'airtable.com' || host.endsWith('.airtable.com')) && /^\/(shr|app|pag|embed|form)/i.test(path)) return url.href;
+  if ((host.endsWith('.typeform.com') && path.length > 1) || (host === 'typeform.com' && path.startsWith('/to/'))) return url.href;
+  if ((host === 'anketolog.ru' || host.endsWith('.anketolog.ru'))
+    && path.length > 1
+    && !/^\/(pricing|tarif|about|blog|login|register)\b/i.test(path)) return url.href;
+  if ((host === 'quiz.marquiz.ru' || host.endsWith('.marquiz.ru') || host === 'mrqz.me') && path.length > 1) return url.href;
   return '';
 }
 

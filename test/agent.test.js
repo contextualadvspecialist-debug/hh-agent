@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Agent, telegramPollBackoffMs } from '../src/agent.js';
-import { openDb, upsertVacancy, listMessages, getChat, getChatForm, countPendingChatForms, recordChatForm, upsertChat, addMessage, recordApplication, setScore, setVacancyStatus, getVacancy, kvSet } from '../src/db.js';
+import { AuthError } from '../src/browser.js';
+import { openDb, upsertVacancy, listMessages, getChat, getChatForm, countPendingChatForms, recordChatForm, upsertChat, addMessage, recordApplication, setScore, setVacancyStatus, getVacancy, kvGet, kvSet } from '../src/db.js';
 
 function makeChatPage({ unread = [], all = [], responses = {}, employer = 'Работодатель' } = {}) {
   let mode = 'unread';
@@ -793,6 +794,232 @@ test('scanOnce считает отсеянные не-удалённые вак�
 
     await Agent.prototype.checkChatsOnce.call(chatAgent);
     assert.equal(getChat(db, '6001')?.vacancy_id, '200002');
+  } finally {
+    db.close();
+  }
+});
+
+test('/forms показывает незаполненные анкеты, а markFormDone чередует ответы и использует LLM', async () => {
+  const db = openDb(':memory:');
+  const sent = [];
+  const edits = [];
+  const sentToHh = [];
+  const fakeChatFrame = {
+    url: () => 'https://chatik.hh.ru/chat/7001',
+    locator: (sel) => sel.includes('text-input')
+      ? { last: () => ({ waitFor: async () => {}, evaluate: async (_, v) => { sentToHh.push(v); }, inputValue: async () => '' }) }
+      : { first: () => ({ count: async () => 1, click: async () => {} }) }
+  };
+  const chatPage = {
+    url: () => 'https://spb.hh.ru/chat/7001',
+    goto: async () => {},
+    waitForTimeout: async () => {},
+    frames: () => [fakeChatFrame]
+  };
+  const agent = {
+    db,
+    cfg: { hh: { base: 'https://spb.hh.ru', resumes: {} }, resumes: {} },
+    tg: {
+      chatId: '42',
+      answerCallback: async () => {},
+      edit: async (messageId, text, keyboard) => { edits.push({ messageId, text, keyboard }); }
+    },
+    page: async () => chatPage,
+    lock: async (_, fn) => fn(),
+    markFormDone: Agent.prototype.markFormDone,
+    send: async (text, keyboard) => { sent.push({ text, keyboard }); return true; },
+    log: () => {},
+    llm: null
+  };
+
+  try {
+    await Agent.prototype.handleUpdate.call(agent, { message: { chat: { id: 42 }, text: '/forms' } });
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /Незаполненных анкет в базе сейчас нет/);
+
+    sent.length = 0;
+    upsertChat(db, { id: '7001', title: 'Alpha LLC', vacancy: 'AI-разработчик' });
+    recordChatForm(db, { chatId: '7001', url: 'https://tally.so/r/form7001', msgExtId: '1', status: 'pending' });
+    addMessage(db, { chatId: '7001', extId: '1', direction: 'in', text: 'Заполните анкету https://tally.so/r/form7001' });
+
+    await Agent.prototype.handleUpdate.call(agent, { message: { chat: { id: 42 }, text: '/forms' } });
+    assert.equal(sent.length, 2);
+    assert.match(sent[1].text, /Alpha LLC/);
+    assert.match(sent[1].text, /tally\.so\/r\/form7001/);
+    const rowBtns = sent[1].keyboard.flat();
+    assert.ok(rowBtns.some((b) => b.callback_data === 'fmdone:7001'));
+    assert.ok(rowBtns.some((b) => b.callback_data === 'fmsent:7001'));
+
+    // Две подряд отправки с llm=null дают разные варианты ответа без повторения.
+    await agent.markFormDone('7001', { replyInChat: true });
+    await agent.markFormDone('7001', { replyInChat: true });
+    assert.equal(sentToHh.length, 2);
+    assert.notEqual(sentToHh[0], sentToHh[1]);
+    assert.match(sentToHh[0], /Анкету заполнил/);
+
+    // При наличии LLM ответ строится по контексту чата.
+    agent.llm = async () => 'Заполнил вашу анкету по AI-разработчику, буду рад обратной связи!';
+    await agent.markFormDone('7001', { replyInChat: true });
+    assert.equal(sentToHh[2], 'Заполнил вашу анкету по AI-разработчику, буду рад обратной связи!');
+
+    // Кнопка fmdone закрывает старую анкету.
+    recordChatForm(db, { chatId: '7001', url: 'https://tally.so/r/second', msgExtId: '2', status: 'pending' });
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: {
+        id: 'cb_fm',
+        data: 'fmdone:7001',
+        message: { message_id: 501, chat: { id: 42 }, text: 'Анкета' }
+      }
+    });
+    assert.equal(getChatForm(db, '7001', 'https://tally.so/r/second')?.status, 'submitted');
+    assert.equal(edits.length, 1);
+  } finally {
+    db.close();
+  }
+});
+
+test('handleQuestions добавляет кнопки Переписать/Пропустить, переписывает без Chrome и пропускает по sk', async () => {
+  const db = openDb(':memory:');
+  const sent = [];
+  const edits = [];
+  let pageCalls = 0;
+  let llmRound = 0;
+  const questions = [
+    { index: 0, type: 'input', label: 'Сколько лет опыта?', options: [] },
+    { index: 1, type: 'radio', label: 'Формат работы', options: ['Удалённо', 'Офис'] },
+    { index: 2, type: 'select', label: 'Релокация', options: ['Да', 'Нет'] }
+  ];
+  const agent = {
+    db,
+    cfg: {
+      hh: { base: 'https://spb.hh.ru' },
+      resumes: { ai: { id: 'r1', title: 'AI' } }
+    },
+    profile: {
+      fullName: 'Тест Кандидат',
+      city: 'СПб',
+      experience: '3 года',
+      lastCompany: 'ООО Вектор',
+      availability: 'удалённо',
+      contacts: { telegram: '@test', phone: '+7000' },
+      roles: { ai: { headline: 'AI', facts: ['Делал LLM-агентов'] }, direct: { headline: 'Dir', facts: ['Директ'] } }
+    },
+    tg: {
+      chatId: '42',
+      answerCallback: async () => {},
+      edit: async (messageId, text, keyboard) => { edits.push({ messageId, text, keyboard }); }
+    },
+    responseUrl: Agent.prototype.responseUrl,
+    draftAnswers: Agent.prototype.draftAnswers,
+    saveAnswers: Agent.prototype.saveAnswers,
+    answersDraft: Agent.prototype.answersDraft,
+    handleQuestions: Agent.prototype.handleQuestions,
+    rewriteQuestions: Agent.prototype.rewriteQuestions,
+    rememberSkip: Agent.prototype.rememberSkip,
+    page: async () => { pageCalls++; return {}; },
+    llm: async () => {
+      llmRound++;
+      return llmRound === 1
+        ? JSON.stringify(['3 года', 'Удалённо', 'Нет'])
+        : JSON.stringify(['Более 3 лет в коммерции', 'Удалённо', 'Нет']);
+    },
+    send: async (text, keyboard) => { sent.push({ text, keyboard }); return true; },
+    log: () => {}
+  };
+
+  try {
+    upsertVacancy(db, { id: '9001', title: 'AI-разработчик', company: 'Beta', url: 'u', snippet: 'LLM', query: 'llm' });
+    const v = getVacancy(db, '9001');
+    await agent.handleQuestions(v, { vacancyId: '9001', resumeKey: 'ai', resumeId: 'r1', letter: 'Привет', questions });
+
+    assert.equal(sent.length, 1);
+    assert.match(sent[0].text, /\[строка\]/);
+    assert.match(sent[0].text, /\[выбор одного\]/);
+    assert.match(sent[0].text, /Удалённо \/ Офис/);
+    const btns = sent[0].keyboard.flat().map((b) => b.callback_data).filter(Boolean);
+    assert.deepEqual(btns, ['afill:9001:ai', 'arewrite:9001:ai', 'sk:9001']);
+
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: {
+        id: 'cb_rew',
+        data: 'arewrite:9001:ai',
+        message: { message_id: 601, chat: { id: 42 }, text: 'Анкета' }
+      }
+    });
+    assert.equal(pageCalls, 0);
+    assert.equal(sent.length, 2);
+    assert.match(sent[1].text, /Более 3 лет в коммерции/);
+    assert.deepEqual(agent.answersDraft('9001')?.answers, ['Более 3 лет в коммерции', 'Удалённо', 'Нет']);
+
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: {
+        id: 'cb_sk',
+        data: 'sk:9001',
+        message: { message_id: 602, chat: { id: 42 }, text: 'Анкета' }
+      }
+    });
+    assert.equal(getVacancy(db, '9001')?.status, 'skipped');
+    assert.equal(edits.length, 1);
+  } finally {
+    db.close();
+  }
+});
+
+test('runScheduledTask троттлит алерты о потере логина (1/3ч + восстановление) и 3+ сбоях подряд', async () => {
+  const db = openDb(':memory:');
+  const sent = [];
+  const agent = {
+    db,
+    cfg: { limits: { alertCooldownHours: 3 } },
+    schedulerErrors: { scan: 0, chats: 0, status: 0 },
+    alertCooldownMs: Agent.prototype.alertCooldownMs,
+    alertAuthLost: Agent.prototype.alertAuthLost,
+    maybeAlertAuthRecovered: Agent.prototype.maybeAlertAuthRecovered,
+    clearSchedulerError: Agent.prototype.clearSchedulerError,
+    recordSchedulerError: Agent.prototype.recordSchedulerError,
+    runScheduledTask: Agent.prototype.runScheduledTask,
+    send: async (text) => { sent.push(text); return true; },
+    log: () => {}
+  };
+
+  try {
+    // Потеря авторизации шлёт алерт сразу, но не спамит чаще 3 часов.
+    await agent.runScheduledTask('chats', async () => { throw new AuthError('сессия hh.ru истекла (чаты)'); });
+    await agent.runScheduledTask('status', async () => { throw new AuthError('нет логина на hh.ru'); });
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /Потеряна авторизация на hh\.ru/);
+    assert.equal(kvGet(db, 'authAlertActive'), '1');
+
+    // Когда cooldown прошёл, повторный разлогин снова уведомляет.
+    kvSet(db, 'lastAuthAlertAt', String(Date.now() - 4 * 3600_000));
+    await agent.runScheduledTask('chats', async () => { throw new AuthError('сессия истекла повторно'); });
+    assert.equal(sent.length, 2);
+
+    // После успешного тика отправляется сообщение о восстановлении.
+    await agent.runScheduledTask('chats', async () => ({ chats: 0, pending: 0 }));
+    assert.equal(sent.length, 3);
+    assert.match(sent[2], /Авторизация на hh\.ru восстановлена/);
+    assert.equal(kvGet(db, 'authAlertActive'), '');
+
+    // Обычные ошибки шлют алерт только на 3-й сбой подряд и тоже с паузой 3 часа.
+    await agent.runScheduledTask('status', async () => { throw new Error('timeout 1'); });
+    await agent.runScheduledTask('status', async () => { throw new Error('timeout 2'); });
+    assert.equal(sent.length, 3);
+    await agent.runScheduledTask('status', async () => { throw new Error('timeout 3'); });
+    await agent.runScheduledTask('status', async () => { throw new Error('timeout 4'); });
+    assert.equal(sent.length, 4);
+    assert.match(sent[3], /Сбой планировщика \(статусы откликов\).*3 ошибок подряд/);
+
+    // Успех сбрасывает счётчик подряд идущих сбоев.
+    await agent.runScheduledTask('status', async () => ({ total: 5, changed: 0, adopted: 0 }));
+    assert.equal(agent.schedulerErrors.status, 0);
+
+    // Тотальный сбой всех батчей в scanOnce тоже учитывается.
+    for (let i = 0; i < 3; i++) {
+      await agent.runScheduledTask('scan', async () => ({ found: 0, totalBatches: 2, errors: ['err1', 'err2'] }));
+    }
+    assert.equal(sent.length, 5);
+    assert.match(sent[4], /Сбой планировщика \(скан вакансий\).*3 ошибок подряд/);
   } finally {
     db.close();
   }

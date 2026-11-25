@@ -1,3 +1,4 @@
+import { assertLoggedIn } from './browser.js';
 import { CaptchaError, detectCaptcha, safeBodyText } from './hh-search.js';
 
 // hh размечает состояние переговоров вкладками-фильтрами: ?state=INTERVIEW и т.д.
@@ -36,11 +37,9 @@ export async function listNegotiations(page, cfg) {
   await page.goto(`${base}state=READ&state=UNREAD`, { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(2500);
   if (await detectCaptcha(page)) throw new CaptchaError('капча в переговорах');
+  await assertLoggedIn(page, 'нет логина на hh.ru');
 
   const body = await safeBodyText(page);
-  if (/Войти с паролем/.test(body) && !/Отклики|Ожидание/.test(body)) {
-    throw new Error('нет логина на hh.ru');
-  }
 
   const byId = new Map();
   for (const { query, status } of STATE_FILTERS) {

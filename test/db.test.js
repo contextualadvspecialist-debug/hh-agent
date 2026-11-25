@@ -6,7 +6,7 @@ import {
   recordApplication, countApplicationsSince, addMessage, listMessages, upsertChat, getChat, setChatVacancy,
   setVacancyFit, snippetFingerprint, listRuleScored, getApplication, markApplicationDelivered,
   setApplicationHhStatus, applicationFunnel, applicationFunnelByQuery, purgeLowVacancies, archiveStaleNewVacancies,
-  recordChatForm, getChatForm, markChatHandled, getChatHandled, countPendingChatForms
+  recordChatForm, getChatForm, markChatHandled, getChatHandled, countPendingChatForms, listPendingChatForms
 } from '../src/db.js';
 
 test('схема создаёт индексы для частых фильтров и сортировок', () => {
@@ -223,6 +223,35 @@ test('archiveStaleNewVacancies переводит старые new в stale, а 
 
     const recent = listVacancies(db, 'new', 10, { order: 'recent' });
     assert.deepEqual(recent.map((v) => v.id), ['day2Top', 'day2Mid', 'day1Low']);
+  } finally {
+    db.close();
+  }
+});
+
+test('listPendingChatForms возвращает только pending с данными чата и сортировкой по свежести', () => {
+  const db = openDb(':memory:');
+  try {
+    upsertChat(db, { id: 'c1', title: 'Alpha HR', vacancy: 'Директолог', vacancyId: 'v1' });
+    upsertChat(db, { id: 'c2', title: '', vacancy: 'AI-менеджер', vacancyId: 'v2' });
+    upsertChat(db, { id: 'c3', title: 'Gamma', vacancy: 'Маркетолог', vacancyId: 'v3' });
+
+    recordChatForm(db, { chatId: 'c1', url: 'https://tally.so/r/old1', msgExtId: '10', status: 'pending' });
+    recordChatForm(db, { chatId: 'c2', url: 'https://forms.gle/new2', msgExtId: '20', status: 'pending' });
+    recordChatForm(db, { chatId: 'c3', url: 'https://forms.gle/done3', msgExtId: '30', status: 'submitted' });
+
+    db.prepare("UPDATE chat_forms SET notified_at = '2026-02-01T10:00:00.000Z' WHERE chat_id = 'c1'").run();
+    db.prepare("UPDATE chat_forms SET notified_at = '2026-02-02T10:00:00.000Z' WHERE chat_id = 'c2'").run();
+
+    const rows = listPendingChatForms(db, 10);
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].chat_id, 'c2');
+    assert.equal(rows[0].title, 'c2');
+    assert.equal(rows[0].vacancy, 'AI-менеджер');
+    assert.equal(rows[0].vacancy_id, 'v2');
+    assert.equal(rows[1].chat_id, 'c1');
+    assert.equal(rows[1].title, 'Alpha HR');
+
+    assert.equal(listPendingChatForms(db, 1).length, 1);
   } finally {
     db.close();
   }

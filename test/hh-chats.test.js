@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
-import { readChat, extractFormLinks } from '../src/hh-chats.js';
+import { AuthError } from '../src/browser.js';
+import { readChat, extractFormLinks, listUnreadChats, formUrl } from '../src/hh-chats.js';
 
 const CHAT_ID = '5784028368';
 const CHAT_URL = `https://spb.hh.ru/chat/${CHAT_ID}`;
@@ -93,4 +94,62 @@ test('extractFormLinks распознаёт Google и Яндекс Формы и
     'https://forms.gle/abc123',
     'https://forms.yandex.ru/u/test/'
   ]);
+});
+
+test('formUrl и extractFormLinks распознают tally, airtable, typeform, anketolog и marquiz', () => {
+  const valid = [
+    'https://tally.so/r/wxyz12',
+    'https://airtable.com/shrAbc12345',
+    'https://company.typeform.com/to/qwe987',
+    'https://typeform.com/to/direct12',
+    'https://anketolog.ru/s/123456',
+    'https://quiz.marquiz.ru/654321abcd',
+    'https://mrqz.me/abcd12'
+  ];
+  for (const url of valid) {
+    assert.equal(formUrl(`${url}.`), url);
+  }
+
+  const ignored = [
+    'https://tally.so/',
+    'https://airtable.com/pricing',
+    'https://typeform.com/pricing',
+    'https://anketolog.ru/pricing',
+    'https://anketolog.ru/blog/article',
+    'https://hh.ru/vacancy/123'
+  ];
+  for (const url of ignored) {
+    assert.equal(formUrl(url), '');
+  }
+
+  const found = extractFormLinks([
+    { text: 'Пройдите https://tally.so/r/wxyz12, https://quiz.marquiz.ru/654321abcd)' },
+    { links: ['https://airtable.com/appTest/form', 'https://anketolog.ru/pricing'], text: '' }
+  ]);
+  assert.deepEqual(found.sort(), [
+    'https://airtable.com/appTest/form',
+    'https://quiz.marquiz.ru/654321abcd',
+    'https://tally.so/r/wxyz12'
+  ]);
+});
+
+test('listUnreadChats бросает AuthError при редиректе на страницу входа hh.ru', async () => {
+  const fakePage = {
+    url: () => 'https://spb.hh.ru/account/login?backurl=%2Fchat',
+    async goto() {},
+    async waitForTimeout() {},
+    locator() {
+      return {
+        first() { return this; },
+        async waitFor() {},
+        async count() { return 0; },
+        async innerText() { return 'Вход в личный кабинет'; }
+      };
+    }
+  };
+
+  await assert.rejects(
+    () => listUnreadChats(fakePage, { hh: { base: 'https://spb.hh.ru' } }),
+    (err) => err instanceof AuthError && /истекла/.test(err.message)
+  );
 });

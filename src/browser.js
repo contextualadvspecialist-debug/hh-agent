@@ -39,6 +39,37 @@ export async function newPage(ctx) {
   return page;
 }
 
+export class AuthError extends Error {
+  constructor(message = 'нет логина на hh.ru') {
+    super(message);
+    this.name = 'AuthError';
+  }
+}
+
+export async function looksLoggedOut(page) {
+  const url = typeof page?.url === 'function' ? String(page.url() || '') : '';
+  if (/\/account\/login|\/logon/.test(url)) return true;
+
+  const bodyLoc = page?.locator?.('body');
+  const rawBody = bodyLoc && typeof bodyLoc.innerText === 'function'
+    ? await bodyLoc.innerText().catch(() => '')
+    : '';
+  const body = rawBody.replace(/\u00a0/g, ' ');
+  if (!/Войти с паролем|Вход в личный кабинет/.test(body)) return false;
+
+  const uiLoc = page?.locator?.('[data-qa="chatik-layout"], [data-qa="mainmenu_applicantProfile"], [data-qa="mainmenu_profile"]');
+  const hasUiCount = uiLoc && typeof uiLoc.count === 'function'
+    ? await uiLoc.count().catch(() => 0)
+    : 0;
+  const hasLoggedUi = /Отклики и приглашения|Отклики|Ожидание|Резюме и профиль|Мои резюме|Создать резюме/.test(body)
+    || Boolean(hasUiCount);
+  return !hasLoggedUi;
+}
+
+export async function assertLoggedIn(page, message = 'нет логина на hh.ru') {
+  if (await looksLoggedOut(page)) throw new AuthError(message);
+}
+
 export async function checkLoggedIn(page, cfg) {
   await page.goto(`${cfg.hh.base}/applicant/negotiations`, { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(2500);

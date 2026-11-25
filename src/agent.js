@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { getContext, newPage, checkLoggedIn, closeContext } from './browser.js';
+import { getContext, newPage, checkLoggedIn, closeContext, AuthError, assertLoggedIn } from './browser.js';
 import { searchQuery, getVacancyDetails, CaptchaError, detectCaptcha } from './hh-search.js';
 import { applyToVacancy, readResponseQuestions, fillResponseAnswers, submitResponseForm } from './hh-apply.js';
 import { listUnreadChats, listAllChats, readChat, sendChatMessage, cleanVacancyTitle, extractFormLinks } from './hh-chats.js';
@@ -20,7 +20,7 @@ import {
   recentVacancies, setApplicationHhStatus, listApplications, adoptNegotiation, setVacancyFit,
   countVacanciesSince, countApplicationsByHhStatus, snippetFingerprint, listRuleScored,
   markApplicationDelivered, applicationFunnel, applicationFunnelByQuery, purgeLowVacancies, archiveStaleNewVacancies,
-  recentSnippets, recordChatForm, getChatForm, markChatHandled, getChatHandled, countPendingChatForms
+  recentSnippets, recordChatForm, getChatForm, markChatHandled, getChatHandled, countPendingChatForms, listPendingChatForms
 } from './db.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -76,6 +76,139 @@ function funnelGroups(rows) {
   return [...map.values()].sort((a, b) => b.total - a.total);
 }
 
+const SCHEDULER_LABELS = {
+  scan: 'скан вакансий',
+  chats: 'чаты hh',
+  status: 'статусы откликов'
+};
+
+const isAuthError = (err) => err instanceof AuthError
+  || err?.name === 'AuthError'
+  || /нет логина на hh\.ru|сессия hh\.ru истекла/i.test(String(err?.message ?? ''));
+
+const FORM_DONE_REPLIES = [
+  'Анкету заполнил, спасибо! Буду рад продолжить общение.',
+  'Анкету заполнил, ответы отправил. Подскажите, пожалуйста, по следующим шагам.',
+  'Анкету заполнил! Если потребуются дополнительные детали — с удовольствием расскажу.',
+  'Анкету заполнил, всё внёс в форму. На связи, готов к диалогу!'
+];
+
+const QUESTION_TYPE_LABELS = {
+  textarea: 'развёрнутый ответ',
+  input: 'строка',
+  radio: 'выбор одного',
+  checkbox: 'несколько вариантов',
+  select: 'список'
+};
+
+function formatQuestionLine(q, i) {
+  const typeHint = q?.type && q.type !== 'textarea'
+    ? ` [${QUESTION_TYPE_LABELS[q.type] || q.type}]`
+    : '';
+  const opts = Array.isArray(q?.options) && q.options.length
+    ? ` (варианты: ${q.options.slice(0, 8).join(' / ')})`
+    : '';
+  return `${i + 1}) ${q?.label ?? ''}${typeHint}${opts}`;
+}
+
+// Вынесено на уровень модуля, чтобы изолированные тесты markFormDone без полного экземпляра Agent не ломались.
+async function draftFormDoneReply(agent, chatId, chat) {
+  const lastIdx = Number(kvGet(agent.db, 'lastFormDoneReplyIdx', -1));
+  const nextIdx = Number.isFinite(lastIdx)
+    ? (lastIdx + 1) % FORM_DONE_REPLIES.length
+    : 0;
+  kvSet(agent.db, 'lastFormDoneReplyIdx', String(nextIdx));
+  const fallback = FORM_DONE_REPLIES[nextIdx];
+  if (!agent.llm) return fallback;
+
+  const recent = listMessages(agent.db, chatId, 8)
+    .filter((m) => m.direction === 'in')
+    .slice(-4)
+    .map((m) => String(m.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 300))
+    .filter(Boolean);
+
+  try {
+    const raw = await agent.llm([
+      {
+        role: 'system',
+        content: 'Пиши коротко и по-человечески от лица кандидата (мужской род, 1–2 предложения, без markdown и без кавычек).'
+      },
+      {
+        role: 'user',
+        content: `Кандидат только что заполнил внешнюю анкету по вакансии «${chat?.vacancy || 'не указана'}» (работодатель: ${chat?.title || 'HR'}).`
+          + (recent.length ? `\nПоследние входящие сообщения из чата:\n${recent.map((t) => `- ${t}`).join('\n')}` : '')
+          + '\nНапиши живой деловой ответ в чат hh.ru о том, что анкета заполнена. Не повторяй канцелярских штампов.'
+      }
+    ], { temperature: 0.7, maxTokens: 160 });
+    const cleaned = String(raw ?? '').replace(/^["'«»]+|["'«»]+$/g, '').replace(/\s+/g, ' ').trim();
+    if (cleaned.length >= 10 && cleaned.length <= 320) return cleaned;
+  } catch (e) {
+    agent.log?.(`form reply ${chatId}: ${e.message}`);
+  }
+  return fallback;
+}
+
+async function sendQuestionsCard(agent, v, { vacancyId, resumeKey, questions, answers }) {
+  const qText = questions.length
+    ? questions.map((q, i) => formatQuestionLine(q, i)).join('\n')
+    : 'поля не распознались';
+  const aText = answers.length
+    ? answers.map((t, i) => `${i + 1}) ${t}`).join('\n')
+    : '';
+  const body = `📝 <b>Анкета: ${esc(v.title || vacancyId)}</b>\n${esc(v.company || '')}\n\n`
+    + `<b>Вопросы</b>\n${esc(qText)}\n\n`
+    + (answers.length
+      ? `<b>Черновики ответов</b>\n${esc(aText)}\n\n<i>Заполню поля только после нажатия кнопки.</i>`
+      : '<i>Черновик не сгенерирован — перепишите или заполните вручную.</i>');
+
+  const formUrl = typeof agent.responseUrl === 'function'
+    ? agent.responseUrl(vacancyId)
+    : `${agent.cfg.hh.base}/applicant/vacancy_response?vacancyId=${vacancyId}&startedWithQuestion=false`;
+
+  const row1 = [
+    ...(answers.length ? [{ text: '✍️ Заполнить поля', callback_data: `afill:${vacancyId}:${resumeKey}` }] : []),
+    ...(questions.length ? [{ text: '🔄 Переписать', callback_data: `arewrite:${vacancyId}:${resumeKey}` }] : [])
+  ];
+  const keyboard = [
+    ...(row1.length ? [row1] : []),
+    [
+      { text: '🔗 Открыть форму', url: formUrl },
+      { text: '🗑 Пропустить', callback_data: `sk:${vacancyId}` }
+    ]
+  ];
+  await agent.send(body, keyboard);
+}
+
+async function sendPendingForms(agent) {
+  const total = countPendingChatForms(agent.db);
+  const forms = listPendingChatForms(agent.db, 15);
+  if (!forms.length) {
+    await agent.send('📝 Незаполненных анкет в базе сейчас нет.');
+    return 0;
+  }
+  const head = total > forms.length
+    ? `📝 <b>Незаполненные анкеты: ${total}</b> (показываю ${forms.length} свежих)`
+    : `📝 <b>Незаполненные анкеты: ${total}</b>`;
+  await agent.send(head);
+
+  for (const f of forms) {
+    const title = f.vacancy
+      ? `<b>${esc(f.title)}</b> — ${esc(f.vacancy)}`
+      : `<b>${esc(f.title)}</b>`;
+    const date = String(f.notified_at || f.updated_at || '').slice(0, 10);
+    const body = `📝 ${title}\n<code>${esc(f.url)}</code>${date ? `\n<i>Обнаружена: ${esc(date)}</i>` : ''}`;
+    await agent.send(body, [
+      [{ text: '📝 Открыть анкету', url: f.url }],
+      [
+        { text: '✅ Заполнена / закрыть', callback_data: `fmdone:${f.chat_id}` },
+        { text: '✅ Заполнена + написать HR', callback_data: `fmsent:${f.chat_id}` }
+      ],
+      [{ text: '🔗 Открыть чат', url: `${agent.cfg.hh.base}/chat/${f.chat_id}` }]
+    ]);
+  }
+  return forms.length;
+}
+
 // Единое завершение Telegram-карточек: дописывает статус и снимает устаревшие кнопки.
 async function finishCard(agent, message, note) {
   if (message?.message_id && agent.tg?.edit) {
@@ -101,9 +234,89 @@ export class Agent {
     this.queue = this.loadQueue();
     // Смещение Telegram тоже переживает рестарт: иначе бот заново разбирает старые команды.
     this.offset = Number(kvGet(this.db, 'tgOffset', 0)) || 0;
+    this.schedulerErrors = { scan: 0, chats: 0, status: 0 };
     this.stopped = false;
     this.timers = [];
     fs.mkdirSync(cfg.paths.letters, { recursive: true });
+  }
+
+  alertCooldownMs() {
+    return (this.cfg?.limits?.alertCooldownHours ?? 3) * 3600_000;
+  }
+
+  async alertAuthLost(reason = '') {
+    kvSet(this.db, 'authAlertActive', '1');
+    const last = Number(kvGet(this.db, 'lastAuthAlertAt', 0)) || 0;
+    const now = Date.now();
+    if (last && now - last < this.alertCooldownMs()) {
+      this.log?.('hh auth: повторный алерт подавлен (cooldown)');
+      return false;
+    }
+    kvSet(this.db, 'lastAuthAlertAt', String(now));
+    await this.send(
+      `🔐 <b>Потеряна авторизация на hh.ru</b>\n`
+      + (reason ? `<i>${esc(reason)}</i>\n\n` : '\n')
+      + 'Фоновый скан, чаты и статусы временно не работают.\n'
+      + 'Перелогиньтесь в Chrome профиля <code>profile/</code> и выполните /restart.'
+    );
+    return true;
+  }
+
+  async maybeAlertAuthRecovered() {
+    if (kvGet(this.db, 'authAlertActive', '') !== '1') return false;
+    kvSet(this.db, 'authAlertActive', '');
+    kvSet(this.db, 'lastAuthAlertAt', '0');
+    await this.send('🟢 <b>Авторизация на hh.ru восстановлена.</b>');
+    return true;
+  }
+
+  clearSchedulerError(kind) {
+    this.schedulerErrors ??= { scan: 0, chats: 0, status: 0 };
+    this.schedulerErrors[kind] = 0;
+    kvSet(this.db, `lastErrorAlert:${kind}`, '0');
+  }
+
+  async recordSchedulerError(kind, error) {
+    if (isAuthError(error)) {
+      await this.alertAuthLost(error?.message || `ошибка в ${SCHEDULER_LABELS[kind] || kind}`);
+      return { kind, auth: true };
+    }
+    this.schedulerErrors ??= { scan: 0, chats: 0, status: 0 };
+    const count = (this.schedulerErrors[kind] = (this.schedulerErrors[kind] ?? 0) + 1);
+    if (count < 3) return { kind, count, alerted: false };
+
+    const key = `lastErrorAlert:${kind}`;
+    const last = Number(kvGet(this.db, key, 0)) || 0;
+    const now = Date.now();
+    if (last && now - last < this.alertCooldownMs()) {
+      return { kind, count, alerted: false, throttled: true };
+    }
+    kvSet(this.db, key, String(now));
+    const label = SCHEDULER_LABELS[kind] || kind;
+    await this.send(
+      `⚠️ <b>Сбой планировщика (${esc(label)})</b>: ${count} ошибок подряд.\n`
+      + `Последняя: <code>${esc(String(error?.message ?? error ?? 'неизвестно').slice(0, 300))}</code>`
+    );
+    return { kind, count, alerted: true };
+  }
+
+  async runScheduledTask(kind, fn) {
+    try {
+      const res = await fn();
+      if (kind === 'scan' && res && res.totalBatches > 0 && res.errors?.length >= res.totalBatches && res.found === 0) {
+        await this.recordSchedulerError('scan', new Error(res.errors[0] || 'все поисковые запросы завершились ошибкой'));
+        return res;
+      }
+      this.clearSchedulerError(kind);
+      if (kind !== 'scan' || (res?.totalBatches > 0 && (!res.errors || res.errors.length === 0))) {
+        await this.maybeAlertAuthRecovered();
+      }
+      return res;
+    } catch (e) {
+      this.log(`${kind}: ${e.message}`);
+      await this.recordSchedulerError(kind, e).catch(() => {});
+      return null;
+    }
   }
 
   async page(name) {
@@ -292,6 +505,7 @@ ${(v.snippet || '').slice(0, 4000)}
         try {
           items = await searchQuery(page, this.cfg, query, p);
         } catch (e) {
+          if (isAuthError(e)) throw e;
           if (e instanceof CaptchaError) {
             errors.push(`капча: «${query}»`);
             break;
@@ -435,6 +649,12 @@ ${(v.snippet || '').slice(0, 4000)}
       }
     }
 
+    if (seen.size === 0 && batches.length > 0 && errors.length === 0) {
+      if (!(await checkLoggedIn(page, this.cfg))) {
+        throw new AuthError('сессия hh.ru истекла (поиск)');
+      }
+    }
+
     this.log(`scan: найдено ${addedAI.length + addedDirect.length}, подходящих ${matched.length}, переоценено +${rescored.length}, дублей ${dupCount}, не удалёнка ${nonRemoteCount}, авторазборов ${autoFits}`);
     if (nonRemoteCount >= 10 && addedAI.length + addedDirect.length === 0) {
       this.log(`scan: все ${nonRemoteCount} новых вакансий отфильтрованы по удалёнке — проверьте разметку hh.ru`);
@@ -446,6 +666,7 @@ ${(v.snippet || '').slice(0, 4000)}
       direct: directMatched,
       rescored: rescored.length,
       nonRemote: nonRemoteCount,
+      totalBatches: batches.length,
       errors
     };
   }
@@ -577,6 +798,9 @@ ${(v.snippet || '').slice(0, 4000)}
         await this.processApply(job);
       } catch (e) {
         this.log(`apply ${job.vacancyId}: ${e.message}`);
+        if (isAuthError(e)) {
+          await this.alertAuthLost?.(e.message).catch(() => {});
+        }
         setVacancyStatus(this.db, job.vacancyId, 'error');
         await this.send(
           `⚠️ Ошибка отклика на <b>${esc(job.vacancyId)}</b>: ${esc(e.message.slice(0, 300))}`,
@@ -703,9 +927,19 @@ ${(v.snippet || '').slice(0, 4000)}
   }
 
   // Черновики ответов на анкету: только по фактам профиля, заполнение — после подтверждения.
-  async draftAnswers(v, questions) {
+  async draftAnswers(v, questions, { hint = '' } = {}) {
     if (!this.llm || !questions.length) return [];
     const role = this.profile.roles[v.resume === 'direct' ? 'direct' : 'ai'] ?? this.profile.roles.direct;
+    const qLines = questions.map((q, i) => {
+      const typeHint = q?.type && q.type !== 'textarea'
+        ? ` [${QUESTION_TYPE_LABELS[q.type] || q.type}]`
+        : '';
+      const opts = Array.isArray(q?.options) && q.options.length
+        ? `\n   Варианты (выбери ровно как написано): ${q.options.join(' | ')}`
+        : '';
+      return `${i + 1}. ${q.label}${typeHint}${opts}`;
+    }).join('\n');
+
     const prompt = `Работодатель задаёт вопросы в форме отклика на hh.ru. Напиши ответы от лица кандидата.
 
 Кандидат: ${this.profile.fullName}, ${this.profile.city}, опыт ${this.profile.experience}, последнее место — ${this.profile.lastCompany} (${role.headline}).
@@ -715,9 +949,11 @@ ${role.facts.map((f) => `- ${f}`).join('\n')}
 
 Вакансия: «${v.title}», компания ${v.company || 'не указана'}.
 Вопросы (нумерованы по порядку полей):
-${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
-
-Каждый ответ — 1–3 предложения, по делу, без markdown и без обращения «Уважаемый HR».
+${qLines}
+${hint ? `\nПожелание к стилю/формулировке: ${hint}\n` : ''}
+Для вопросов [выбор одного] и [список] верни строго один из предложенных вариантов дословно.
+Для [несколько вариантов] верни подходящие варианты из списка дословно через запятую (для одиночного флажка — «Да» или «Нет»).
+Для текстовых полей каждый ответ — 1–3 предложения, по делу, без markdown и без обращения «Уважаемый HR».
 Если ответа нет в фактах — не выдумывай: напиши коротко, что готов уточнить, и предложи связаться.
 Верни JSON-массив ровно из ${questions.length} строк в том же порядке, без пояснений.`;
 
@@ -735,8 +971,10 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
     }
   }
 
-  saveAnswers(vacancyId, resumeKey, answers) {
-    kvSet(this.db, `answers:${vacancyId}`, JSON.stringify({ answers, resumeKey, at: Date.now() }));
+  saveAnswers(vacancyId, resumeKey, answers, questions = []) {
+    const prev = questions.length ? null : this.answersDraft(vacancyId);
+    const savedQuestions = questions.length ? questions : (prev?.questions ?? []);
+    kvSet(this.db, `answers:${vacancyId}`, JSON.stringify({ answers, questions: savedQuestions, resumeKey, at: Date.now() }));
   }
 
   answersDraft(vacancyId) {
@@ -756,31 +994,44 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
     this.log(`apply ${vacancyId}: анкета, ${questions.length} полей (снимок формы в letters/${vacancyId}-response.html)`);
 
     const answers = await this.draftAnswers(v, questions);
-    if (answers.length) this.saveAnswers(vacancyId, resumeKey, answers);
+    if (answers.length || questions.length) this.saveAnswers(vacancyId, resumeKey, answers, questions);
 
-    const list = (arr, empty) => (arr.length ? arr.map((t, i) => `${i + 1}) ${t}`).join('\n') : empty);
-    const body = `📝 <b>Анкета: ${esc(v.title)}</b>\n${esc(v.company || '')}\n\n`
-      + `<b>Вопросы</b>\n${esc(list(questions.map((q) => q.label), 'поля не распознались'))}\n\n`
-      + (answers.length
-        ? `<b>Черновики ответов</b>\n${esc(list(answers, ''))}\n\n<i>Заполню поля только после нажатия кнопки.</i>`
-        : '<i>Черновик не сгенерирован — заполните вручную.</i>');
+    await sendQuestionsCard(this, v, { vacancyId, resumeKey, questions, answers });
+  }
 
-    const keyboard = [
-      ...(answers.length ? [[{ text: '✍️ Заполнить поля', callback_data: `afill:${vacancyId}:${resumeKey}` }]] : []),
-      [{ text: '🔗 Открыть форму', url: this.responseUrl(vacancyId) }]
-    ];
-    await this.send(body, keyboard);
+  async rewriteQuestions(vacancyId, resumeKey) {
+    const v = getVacancy(this.db, vacancyId) ?? { id: vacancyId, title: vacancyId, company: '', resume: resumeKey };
+    const draft = this.answersDraft(vacancyId);
+    let questions = Array.isArray(draft?.questions) && draft.questions.length ? draft.questions : [];
+    if (!questions.length) {
+      const page = await this.page('apply');
+      await page.goto(this.responseUrl(vacancyId), { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2500);
+      await assertLoggedIn(page, 'сессия hh.ru истекла (анкета)');
+      questions = await readResponseQuestions(page).catch(() => []);
+    }
+    if (!questions.length) {
+      await this.send(`⚠️ Вопросы анкеты по вакансии <b>${esc(vacancyId)}</b> не распознались — откройте форму вручную.`);
+      return;
+    }
+    const answers = await this.draftAnswers(v, questions, {
+      hint: 'Сформулируй ответы иначе: конкретнее, по делу, без канцелярита и с опорой только на факты.'
+    });
+    if (answers.length || questions.length) this.saveAnswers(vacancyId, resumeKey, answers, questions);
+    await sendQuestionsCard(this, v, { vacancyId, resumeKey, questions, answers });
   }
 
   async fillQuestions(vacancyId, resumeKey) {
     const draft = this.answersDraft(vacancyId);
-    if (!draft?.answers.length) throw new Error('черновик ответов устарел — нажмите «Отклик» заново');
+    if (!draft?.answers.length) throw new Error('черновик ответов устарел — нажмите «Отклик» или «Переписать»');
     const page = await this.page('apply');
     await page.goto(this.responseUrl(vacancyId), { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(2500);
+    await assertLoggedIn(page, 'сессия hh.ru истекла (заполнение анкеты)');
     const r = await fillResponseAnswers(page, draft.answers);
     if (!r.ok) {
-      await this.send(`⚠️ Полей ${r.count}, ответов ${draft.answers.length} — заполнил вручную не буду. Форма: ${this.responseUrl(vacancyId)}`);
+      const detail = r.reason ? `, поле #${(r.index ?? 0) + 1}: ${esc(r.reason)}` : '';
+      await this.send(`⚠️ Полей ${r.count}, ответов ${draft.answers.length}${detail} — проверьте форму вручную: ${this.responseUrl(vacancyId)}`);
       return;
     }
     this.log(`apply ${vacancyId}: поля анкеты заполнены (${r.count})`);
@@ -1409,7 +1660,7 @@ ${editHint && chat?.draft ? `\nПредыдущий черновик ответ�
 
   async markFormDone(chatId, { replyInChat = false } = {}) {
     const chat = getChat(this.db, chatId);
-    const replyText = 'Анкету заполнил, спасибо! Буду рад продолжить общение.';
+    const replyText = replyInChat ? await draftFormDoneReply(this, chatId, chat) : '';
     if (replyInChat) {
       await this.lock('chats', async () => {
         const page = await this.page('chats');
@@ -1484,6 +1735,8 @@ ${editHint && chat?.draft ? `\nПредыдущий черновик ответ�
           await this.previewApply(a, b, { hint: 'Перепиши иначе: другой первый абзац, другая структура и формулировки, те же факты.' });
         } else if (cmd === 'afill' && idOk(a) && resumeOk(b)) {
           await this.fillQuestions(a, b);
+        } else if (cmd === 'arewrite' && idOk(a) && resumeOk(b)) {
+          await this.rewriteQuestions(a, b);
         } else if (cmd === 'asend' && idOk(a) && resumeOk(b)) {
           await this.submitQuestions(a, b);
         } else if (cmd === 'sk' && idOk(a)) {
@@ -1559,7 +1812,7 @@ ${editHint && chat?.draft ? `\nПредыдущий черновик ответ�
       await this.send(
         'Я ищу вакансии на hh, пишу письма и откликаюсь.\n\n' +
         '/scan — проверить выдачу сейчас (AI)\n/direct — директ-пул по запросу (Яндекс Директ)\n' +
-        '/chats — проверить чаты\n/statuses — статусы откликов (просмотрено/приглашение/отказ)\n' +
+        '/chats — проверить чаты\n/forms — незаполненные внешние анкеты\n/statuses — статусы откликов (просмотрено/приглашение/отказ)\n' +
         '/digest — сводка за день\n/status — лимит и очередь\n/stats — конверсия по резюме и запросам\n/restart — перезапустить агента\n' +
         '/block Компания — в чёрный список\n/blocked — список\n/unblock Компания — убрать\n' +
         'Или пришлите ссылку на вакансию — подготовлю карточку с откликом.',
@@ -1596,6 +1849,10 @@ ${editHint && chat?.draft ? `\nПредыдущий черновик ответ�
     if (text === '/chats') {
       const r = await this.checkChats();
       await this.send(`Чаты: непрочитанных ${r.chats}, ждут ответа ${r.pending}.`);
+      return;
+    }
+    if (text === '/forms') {
+      await sendPendingForms(this);
       return;
     }
     if (text === '/more') {
@@ -1724,27 +1981,9 @@ ${editHint && chat?.draft ? `\nПредыдущий черновик ответ�
     const lastStatus = kvGet(this.db, 'lastStatusCheck');
     const digestHour = this.cfg.limits.digestHour ?? 20;
 
-    const tickScan = async () => {
-      try {
-        await this.scan();
-      } catch (e) {
-        this.log(`scan: ${e.message}`);
-      }
-    };
-    const tickChats = async () => {
-      try {
-        await this.checkChats();
-      } catch (e) {
-        this.log(`chats: ${e.message}`);
-      }
-    };
-    const tickStatus = async () => {
-      try {
-        await this.checkStatuses();
-      } catch (e) {
-        this.log(`statuses: ${e.message}`);
-      }
-    };
+    const tickScan = () => this.runScheduledTask('scan', () => this.scan());
+    const tickChats = () => this.runScheduledTask('chats', () => this.checkChats());
+    const tickStatus = () => this.runScheduledTask('status', () => this.checkStatuses());
     const tickDigest = async () => {
       if (!this.tg) return;
       const now = new Date();
