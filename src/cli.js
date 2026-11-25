@@ -6,6 +6,7 @@ import { loadConfig } from './config.js';
 import { Agent } from './agent.js';
 import { waitForLogin, closeContext, checkLoggedIn } from './browser.js';
 import { makeLlmClient, llmReady } from './llm.js';
+import { Telegram } from './tg.js';
 import { getVacancyDetails } from './hh-search.js';
 import { ruleScore } from './score.js';
 import { getVacancy, upsertVacancy, setScore, setVacancyStatus } from './db.js';
@@ -148,12 +149,14 @@ switch (cmd) {
       }
     }
     if (cfg.telegram.token && cfg.telegram.chatId) {
+      const tg = new Telegram(cfg.telegram);
       try {
-        const res = await fetch(`https://api.telegram.org/bot${cfg.telegram.token}/getMe`);
-        const data = await res.json();
-        console.log(`Telegram: ${data.ok ? '@' + data.result.username : data.description}`);
+        const me = await tg.call('getMe');
+        console.log(`Telegram: @${me.username}`);
       } catch (e) {
         console.log(`Telegram ошибка: ${e.message}`);
+      } finally {
+        tg.close();
       }
     } else {
       console.log('Telegram: не настроен (config.telegram или HH_TG_*)');

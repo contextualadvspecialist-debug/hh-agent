@@ -1,3 +1,5 @@
+import { createJsonPoster } from './http.js';
+
 export function llmReady(llm) {
   return Boolean(llm?.baseUrl && llm?.apiKey && llm?.model);
 }
@@ -5,7 +7,8 @@ export function llmReady(llm) {
 export function makeLlmClient(llm) {
   if (!llmReady(llm)) return null;
   const url = `${llm.baseUrl.replace(/\/+$/, '')}/chat/completions`;
-  return async function llmChat(messages, opts = {}) {
+  const http = createJsonPoster({ timeoutMs: 90000 });
+  async function llmChat(messages, opts = {}) {
     const body = {
       model: llm.model,
       messages,
@@ -16,20 +19,17 @@ export function makeLlmClient(llm) {
     const effort = opts.reasoningEffort ?? llm.reasoningEffort;
     if (effort) body.reasoning_effort = effort;
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${llm.apiKey}`
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(90000)
+    const res = await http.post(url, body, {
+      headers: { Authorization: `Bearer ${llm.apiKey}` },
+      timeoutMs: opts.timeoutMs ?? 90000,
+      idempotent: true
     });
     if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`LLM ${res.status}: ${text.slice(0, 300)}`);
+      throw new Error(`LLM ${res.status}: ${res.text().slice(0, 300)}`);
     }
-    const data = await res.json();
+    const data = res.json();
     return data.choices?.[0]?.message?.content ?? '';
-  };
+  }
+  llmChat.reset = () => http.reset();
+  return llmChat;
 }

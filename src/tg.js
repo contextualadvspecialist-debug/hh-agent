@@ -1,3 +1,7 @@
+import { createJsonPoster } from './http.js';
+
+const IDEMPOTENT_METHODS = new Set(['getUpdates', 'getMe']);
+
 export const esc = (s) =>
   String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -23,23 +27,26 @@ export function isOwnerUpdate(update, chatId) {
 }
 
 export class Telegram {
-  constructor({ token, chatId }) {
+  constructor({ token, chatId, timeoutMs = 70000 }) {
     if (!token || !chatId) throw new Error('Telegram: не заданы token и chatId');
     this.token = token;
     this.chatId = String(chatId);
     this.api = `https://api.telegram.org/bot${token}`;
+    this.http = createJsonPoster({ timeoutMs });
   }
 
   async call(method, payload = {}) {
-    const res = await fetch(`${this.api}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(70000)
+    const res = await this.http.post(`${this.api}/${method}`, payload, {
+      idempotent: IDEMPOTENT_METHODS.has(method)
     });
-    const data = await res.json().catch(() => ({}));
+    let data = {};
+    try { data = res.json(); } catch { /* не-JSON ответ обрабатывается через res.status */ }
     if (!data.ok) throw new Error(`Telegram ${method}: ${data.description ?? res.status}`);
     return data.result;
+  }
+
+  close() {
+    this.http.reset();
   }
 
   send(text, keyboard, replyKeyboard) {

@@ -968,6 +968,7 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
         });
       }
 
+      let deliveryFailed = false;
       for (const url of extractFormLinks(data.messages.filter((m) => m.direction === 'in'))) {
         const key = `notifiedForm:${c.id}:${url}`;
         if (kvGet(this.db, key)) continue;
@@ -977,17 +978,26 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
           [[{ text: 'Открыть анкету', url }]]
         );
         if (sent) kvSet(this.db, key, '1');
-        else this.log(`форма ${c.id}: уведомление не доставлено, повторю`);
+        else {
+          deliveryFailed = true;
+          this.log(`форма ${c.id}: уведомление не доставлено, повторю`);
+        }
       }
 
       const lastOut = data.messages.map((m) => m.direction).lastIndexOf('out');
       const pending = data.messages.slice(lastOut + 1).filter((m) => m.direction === 'in');
-      if (!pending.length) continue;
+      if (!pending.length) {
+        if (deliveryFailed) rememberChatRetry(this.db, c, new Error('telegram delivery failed'));
+        continue;
+      }
 
       const lastKey = pending[pending.length - 1].extId;
       const aiPending = pending.some((m) => m.isAi);
       const notificationKey = aiPending ? `notifiedAiChat:${c.id}` : `notifiedChat:${c.id}`;
-      if (kvGet(this.db, notificationKey) === lastKey) continue;
+      if (kvGet(this.db, notificationKey) === lastKey) {
+        if (deliveryFailed) rememberChatRetry(this.db, c, new Error('telegram delivery failed'));
+        continue;
+      }
       pendingCount++;
 
       const chat = getChat(this.db, c.id);
@@ -1002,7 +1012,11 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
           [[{ text: 'Открыть чат', url: `${this.cfg.hh.base}/chat/${c.id}` }]]
         );
         if (sent) kvSet(this.db, notificationKey, lastKey);
-        else this.log(`chat ${c.id}: уведомление об ИИ-помощнике не доставлено, повторю`);
+        else {
+          deliveryFailed = true;
+          this.log(`chat ${c.id}: уведомление об ИИ-помощнике не доставлено, повторю`);
+        }
+        if (deliveryFailed) rememberChatRetry(this.db, c, new Error('telegram delivery failed'));
         continue;
       }
 
@@ -1018,7 +1032,11 @@ ${questions.map((q, i) => `${i + 1}. ${q.label}`).join('\n')}
       const sent = await this.notifyChat(c, chat, pending, draft);
       // Метку ставим только после доставки — иначе карточка теряется навсегда.
       if (sent) kvSet(this.db, `notifiedChat:${c.id}`, lastKey);
-      else this.log(`chat ${c.id}: карточка не доставлена, повторю`);
+      else {
+        deliveryFailed = true;
+        this.log(`chat ${c.id}: карточка не доставлена, повторю`);
+      }
+      if (deliveryFailed) rememberChatRetry(this.db, c, new Error('telegram delivery failed'));
     }
 
     this.log(`chats: непрочитанных ${chats.length}, ждут ответа ${pendingCount}`);
@@ -1626,6 +1644,8 @@ ${history}
       if (this.stopped) return;
       this.stopped = true;
       this.timers.forEach((t) => { clearInterval(t); clearTimeout(t); });
+      this.tg?.close?.();
+      this.llm?.reset?.();
       await closeContext();
       closeDb(this.db);
       try { fs.rmSync(pidFile, { force: true }); } catch { /* файл мог остаться от прошлого запуска */ }

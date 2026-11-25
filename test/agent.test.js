@@ -319,3 +319,52 @@ test('checkChatsOnce отдельно уведомляет о Google Forms и н
     db.close();
   }
 });
+
+test('checkChatsOnce повторяет чат в следующем опросе, если отправка в Telegram не удалась', async () => {
+  const db = openDb(':memory:');
+  const chat = { id: '5802174334', title: 'ООО Тест', subtitle: '', last: 'Ждём ответ', time: '' };
+  const fake = makeChatPage({
+    unread: [chat],
+    all: [chat],
+    employer: chat.title,
+    responses: {
+      [chat.id]: [[
+        { extId: '201', author: 'HR', direction: 'in', text: 'Готовы созвониться завтра?', links: [], ts: '14:00' }
+      ]]
+    }
+  });
+  let deliveryAttempt = 0;
+  const delivered = [];
+  const agent = {
+    db,
+    cfg: {
+      hh: { base: 'https://spb.hh.ru' },
+      limits: { dailyFollowups: 0, chatsBackfillEveryMinutes: 120, chatsRecentLimit: 20 }
+    },
+    page: async () => fake.page,
+    refreshChatDirectory: Agent.prototype.refreshChatDirectory,
+    notifyChat: Agent.prototype.notifyChat,
+    log: () => {},
+    llm: null,
+    send: async (text) => {
+      deliveryAttempt++;
+      if (deliveryAttempt === 1) return false;
+      delivered.push(text);
+      return true;
+    }
+  };
+
+  try {
+    await Agent.prototype.checkChatsOnce.call(agent);
+    assert.equal(delivered.length, 0);
+
+    // На hh чат уже прочитан (unread пуст), но из-за сбоя Telegram он должен повториться следующим проходом.
+    fake.setUnread([]);
+    await Agent.prototype.checkChatsOnce.call(agent);
+    assert.equal(delivered.length, 1);
+    assert.match(delivered[0], /ООО Тест/);
+    assert.match(delivered[0], /Готовы созвониться завтра/);
+  } finally {
+    db.close();
+  }
+});
