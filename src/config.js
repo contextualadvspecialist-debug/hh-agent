@@ -100,34 +100,41 @@ function merge(base, over) {
   return out;
 }
 
-export function loadConfig() {
-  if (!fs.existsSync(CONFIG_PATH)) {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULTS, null, 2), 'utf8');
+export function loadConfig({ configPath = CONFIG_PATH, env = process.env } = {}) {
+  const resolved = path.resolve(configPath);
+  if (!fs.existsSync(resolved)) {
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    fs.writeFileSync(resolved, JSON.stringify(DEFAULTS, null, 2), 'utf8');
   }
   let user;
   try {
-    user = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    user = JSON.parse(fs.readFileSync(resolved, 'utf8'));
   } catch (e) {
     throw new Error(`config.json не читается: ${e.message}`);
   }
   const cfg = merge(DEFAULTS, user);
-  cfg.telegram.token = cfg.telegram.token || process.env.HH_TG_TOKEN || '';
-  cfg.telegram.chatId = cfg.telegram.chatId || process.env.HH_TG_CHAT_ID || '';
-  cfg.llm.baseUrl = cfg.llm.baseUrl || process.env.HH_LLM_BASE_URL || '';
-  cfg.llm.apiKey = cfg.llm.apiKey || process.env.HH_LLM_API_KEY || '';
-  cfg.llm.model = cfg.llm.model || process.env.HH_LLM_MODEL || '';
-  cfg.llm.reasoningEffort = cfg.llm.reasoningEffort || process.env.HH_LLM_REASONING || '';
+  cfg.telegram.token = cfg.telegram.token || env.HH_TG_TOKEN || '';
+  cfg.telegram.chatId = cfg.telegram.chatId || env.HH_TG_CHAT_ID || '';
+  cfg.llm.baseUrl = cfg.llm.baseUrl || env.HH_LLM_BASE_URL || '';
+  cfg.llm.apiKey = cfg.llm.apiKey || env.HH_LLM_API_KEY || '';
+  cfg.llm.model = cfg.llm.model || env.HH_LLM_MODEL || '';
+  cfg.llm.reasoningEffort = cfg.llm.reasoningEffort || env.HH_LLM_REASONING || '';
+  const root = resolved === path.resolve(CONFIG_PATH) ? ROOT : path.dirname(resolved);
   cfg.paths = {
-    root: ROOT,
-    config: CONFIG_PATH,
-    db: path.join(ROOT, 'data.db'),
-    profile: path.join(ROOT, cfg.browser.profile),
-    letters: path.join(ROOT, 'letters')
+    root,
+    config: resolved,
+    db: path.join(root, 'data.db'),
+    profile: path.join(root, cfg.browser.profile),
+    letters: path.join(root, 'letters')
   };
   return cfg;
 }
 
-export function saveConfig(cfg) {
+export function saveConfig(cfg, { configPath } = {}) {
+  const target = configPath || cfg?.paths?.config || CONFIG_PATH;
   const { paths, ...rest } = cfg;
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(rest, null, 2), 'utf8');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, JSON.stringify(rest, null, 2), 'utf8');
 }
+
+export { DEFAULTS, merge };

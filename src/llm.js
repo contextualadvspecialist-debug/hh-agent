@@ -4,7 +4,7 @@ export function llmReady(llm) {
   return Boolean(llm?.baseUrl && llm?.apiKey && llm?.model);
 }
 
-export function makeLlmClient(llm) {
+export function makeLlmClient(llm, { onUsage } = {}) {
   if (!llmReady(llm)) return null;
   const url = `${llm.baseUrl.replace(/\/+$/, '')}/chat/completions`;
   const http = createJsonPoster({ timeoutMs: 90000 });
@@ -28,6 +28,21 @@ export function makeLlmClient(llm) {
       throw new Error(`LLM ${res.status}: ${res.text().slice(0, 300)}`);
     }
     const data = res.json();
+    if (data?.usage && typeof onUsage === 'function') {
+      const promptTokens = Number(data.usage.prompt_tokens) || 0;
+      const completionTokens = Number(data.usage.completion_tokens) || 0;
+      const totalTokens = Number(data.usage.total_tokens) || (promptTokens + completionTokens);
+      try {
+        onUsage({
+          model: data.model || llm.model,
+          promptTokens,
+          completionTokens,
+          totalTokens
+        });
+      } catch (err) {
+        console.warn('[llm] onUsage callback failed:', err?.message || err);
+      }
+    }
     return data.choices?.[0]?.message?.content ?? '';
   }
   llmChat.reset = () => http.reset();

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Agent, telegramPollBackoffMs } from '../src/agent.js';
 import { AuthError } from '../src/browser.js';
-import { openDb, upsertVacancy, listMessages, getChat, getChatForm, countPendingChatForms, recordChatForm, upsertChat, addMessage, recordApplication, setApplicationHhStatus, setScore, setVacancyStatus, getVacancy, kvGet, kvSet } from '../src/db.js';
+import { openDb, upsertVacancy, listMessages, getChat, getChatForm, countPendingChatForms, recordChatForm, upsertChat, addMessage, recordApplication, setApplicationHhStatus, setScore, setVacancyStatus, getVacancy, kvGet, kvSet, recordLlmUsage } from '../src/db.js';
 
 function makeChatPage({ unread = [], all = [], responses = {}, employer = 'Работодатель' } = {}) {
   let mode = 'unread';
@@ -1084,9 +1084,20 @@ test('/digest делит сегодня/воронку, /stats считает к
     assert.match(sent[0].text, /Приглашения: <b>2<\/b>/);
     assert.match(sent[0].text, /Чаты ждут ответа: <b>1<\/b>/);
 
+    recordLlmUsage(db, {
+      day: (() => {
+        const d = new Date();
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      })(),
+      promptTokens: 1200,
+      completionTokens: 300,
+      totalTokens: 1500
+    });
     const stats = agent.statsText();
     assert.match(stats, /Всего: <b>3<\/b> · просмотр <b>3<\/b> \(100%\) · приглашение <b>2<\/b> \(67%\)/);
     assert.match(stats, /AI-резюме: 3 откл\. · просмотр 3 \(100%\) · приглашение 2 \(67%\)/);
+    assert.match(stats, /<b>Расход LLM<\/b>/);
+    assert.match(stats, /1 запр\./);
 
     await Agent.prototype.handleUpdate.call(agent, { message: { chat: { id: 42 }, text: '/status' } });
     const statusMsg = sent.at(-1);
@@ -1094,7 +1105,7 @@ test('/digest делит сегодня/воронку, /stats считает к
     assert.match(statusMsg.text, /Проверки: скан .*мин назад\) · чаты .* · статусы не было/);
     assert.match(statusMsg.text, /AI-разработчик — Альфа/);
     assert.match(statusMsg.text, /Директолог — Бета/);
-    assert.deepEqual(statusMsg.keyboard.flat().map((b) => b.callback_data), ['qdrop:101', 'qdrop:102', 'qclear']);
+    assert.deepEqual(statusMsg.keyboard.flat().map((b) => b.callback_data), ['qdrop:101', 'qdrop:102', 'qclear', 'mode:pause', 'mode:maint']);
 
     await Agent.prototype.handleUpdate.call(agent, {
       callback_query: { id: 'cb_drop', data: 'qdrop:101', message: { message_id: 55, chat: { id: 42 }, text: 'old' } }
@@ -1192,5 +1203,235 @@ test('maintenance и acquirePage чистят kv и ротируют устар�
   } finally {
     db.close();
     fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('apdone, apsk и blk управляют ручными карточками и блокируют компанию целиком', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hh-blk-'));
+  const configPath = path.join(tmp, 'config.json');
+  fs.writeFileSync(configPath, JSON.stringify({ hh: { excludeCompanies: [] } }), 'utf8');
+
+  const db = openDb(':memory:');
+  const sent = [];
+  const edits = [];
+  const agent = {
+    db,
+    cfg: {
+      paths: { config: configPath },
+      hh: { base: 'https://hh.ru', excludeCompanies: [] },
+      resumes: { ai: { id: 'rai', title: 'AI' }, direct: { id: 'rdir', title: 'Директолог' } }
+    },
+    tg: {
+      chatId: '42',
+      answerCallback: async () => {},
+      edit: async (messageId, text, keyboard) => { edits.push({ messageId, text, keyboard }); }
+    },
+    queue: [
+      { vacancyId: '301', resumeKey: 'ai' },
+      { vacancyId: '302', resumeKey: 'direct' },
+      { vacancyId: '303', resumeKey: 'direct' }
+    ],
+    saveQueue: Agent.prototype.saveQueue,
+    rememberSkip: Agent.prototype.rememberSkip,
+    persistCompanies: Agent.prototype.persistCompanies,
+    blockCompany: Agent.prototype.blockCompany,
+    send: async (text, keyboard) => { sent.push({ text, keyboard }); return true; },
+    log: () => {}
+  };
+
+  try {
+    upsertVacancy(db, { id: '301', title: 'ML Engineer', company: 'Хорошая', url: 'u1', snippet: 's' });
+    upsertVacancy(db, { id: '302', title: 'Junior Bot', company: 'Спам Агентство', url: 'u2', snippet: 's' });
+    upsertVacancy(db, { id: '303', title: 'Prompt Dev', company: 'Спам Агентство', url: 'u3', snippet: 's' });
+    upsertVacancy(db, { id: '304', title: 'Manual Role', company: 'Обычная', url: 'u4', snippet: 's' });
+    setVacancyStatus(db, '301', 'manual');
+    setVacancyStatus(db, '302', 'notified');
+    setVacancyStatus(db, '303', 'new');
+    setVacancyStatus(db, '304', 'manual');
+    recordApplication(db, { vacancyId: '304', resumeKey: 'direct', status: 'manual', error: 'форма' });
+
+    // apdone:301:ai отмечает отклик отправленным и убирает из очереди.
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: { id: 'cb_done', data: 'apdone:301:ai', message: { message_id: 10, chat: { id: 42 }, text: 'Нужно вручную' } }
+    });
+    assert.equal(getVacancy(db, '301').status, 'applied');
+    assert.equal(db.prepare('SELECT status FROM applications WHERE vacancy_id = ?').get('301').status, 'applied');
+    assert.equal(agent.queue.some((j) => j.vacancyId === '301'), false);
+
+    // apsk:304 переводит зависшую manual-запись в skipped.
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: { id: 'cb_sk', data: 'apsk:304', message: { message_id: 11, chat: { id: 42 }, text: 'Ошибка' } }
+    });
+    assert.equal(getVacancy(db, '304').status, 'skipped');
+    assert.equal(db.prepare('SELECT status FROM applications WHERE vacancy_id = ?').get('304').status, 'skipped');
+
+    // blk:302 добавляет компанию в чёрный список, закрывает все её активные вакансии и чистит очередь.
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: { id: 'cb_blk', data: 'blk:302', message: { message_id: 12, chat: { id: 42 }, text: 'Вакансия' } }
+    });
+    assert.deepEqual(agent.cfg.hh.excludeCompanies, ['Спам Агентство']);
+    assert.equal(JSON.parse(fs.readFileSync(configPath, 'utf8')).hh.excludeCompanies[0], 'Спам Агентство');
+    assert.equal(getVacancy(db, '302').status, 'skipped');
+    assert.equal(getVacancy(db, '303').status, 'skipped');
+    assert.equal(agent.queue.length, 0);
+    assert.match(edits.at(-1).text, /Скрыто ещё вакансий: 1/);
+  } finally {
+    db.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('runScheduledTask шлёт немедленный алерт при капче с cooldown и прерывает скан', async () => {
+  const { CaptchaError } = await import('../src/hh-search.js');
+  const db = openDb(':memory:');
+  const sent = [];
+  const agent = {
+    db,
+    cfg: {
+      hh: { queriesAI: ['q1', 'q2', 'q3'], pages: 1, remoteOnly: false },
+      limits: { captchaAlertCooldownMinutes: 60 },
+      threshold: 70
+    },
+    schedulerErrors: { scan: 0, chats: 0, status: 0 },
+    clearSchedulerError: Agent.prototype.clearSchedulerError,
+    maybeAlertAuthRecovered: Agent.prototype.maybeAlertAuthRecovered,
+    recordSchedulerError: Agent.prototype.recordSchedulerError,
+    send: async (text) => { sent.push(text); return true; },
+    log: () => {}
+  };
+
+  try {
+    // Прямое исключение CaptchaError сразу уведомляет пользователя без ожидания 3 сбоев.
+    await Agent.prototype.runScheduledTask.call(agent, 'scan', async () => {
+      throw new CaptchaError('нужно решить капчу');
+    });
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /Капча в фоне.*скан вакансий/);
+    assert.equal(agent.schedulerErrors.scan, 0);
+
+    // Повторная капча в течение cooldown (60 мин) подавляется.
+    await Agent.prototype.runScheduledTask.call(agent, 'scan', async () => ({
+      found: 0,
+      matched: 0,
+      totalBatches: 3,
+      captcha: true,
+      captchaReason: 'поиск «q1»',
+      errors: ['капча: «q1»']
+    }));
+    assert.equal(sent.length, 1);
+
+    // Капча по другому каналу (chats) уведомляет независимо.
+    await Agent.prototype.runScheduledTask.call(agent, 'chats', async () => ({
+      chats: 0,
+      pending: 0,
+      captcha: true,
+      captchaReason: 'чаты hh'
+    }));
+    assert.equal(sent.length, 2);
+    assert.match(sent[1], /чаты hh/);
+  } finally {
+    db.close();
+  }
+});
+
+test('/pause, /resume, /maintenance и mode:* управляют фоновыми режимами и сохраняются в БД', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hh-mode-'));
+  const db = openDb(':memory:');
+  const sent = [];
+  const edits = [];
+  const agent = {
+    db,
+    cfg: {
+      paths: { root: tmp },
+      limits: { dailyApplications: 8, sendWindow: { from: 10, to: 19 } }
+    },
+    pages: {},
+    pageCreatedAt: {},
+    queue: [],
+    schedulerErrors: { scan: 0, chats: 0, status: 0 },
+    tg: {
+      chatId: '42',
+      answerCallback: async () => {},
+      edit: async (messageId, text, keyboard) => { edits.push({ messageId, text, keyboard }); }
+    },
+    lock: Agent.prototype.lock,
+    pauseModes: Agent.prototype.pauseModes,
+    isPaused: Agent.prototype.isPaused,
+    setPaused: Agent.prototype.setPaused,
+    statusView: Agent.prototype.statusView,
+    maintenance: Agent.prototype.maintenance,
+    send: async (text, keyboard) => { sent.push({ text, keyboard }); return true; },
+    log: () => {}
+  };
+
+  try {
+    await Agent.prototype.handleUpdate.call(agent, { message: { chat: { id: 42 }, text: '/pause scan' } });
+    assert.equal(agent.isPaused('scan'), true);
+    assert.equal(agent.isPaused('apply'), false);
+    assert.match(agent.statusView().text, /На паузе:.*автоскан/);
+
+    await Agent.prototype.handleUpdate.call(agent, { message: { chat: { id: 42 }, text: '/resume' } });
+    assert.equal(agent.isPaused('scan'), false);
+    assert.equal(agent.isPaused('apply'), false);
+
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: { id: 'cb_pause', data: 'mode:pause', message: { message_id: 77, chat: { id: 42 }, text: 'old' } }
+    });
+    assert.deepEqual(agent.pauseModes(), { scan: true, apply: true });
+    assert.match(edits.at(-1).text, /Пауза включена/);
+    assert.ok(edits.at(-1).keyboard.flat().some((b) => b.callback_data === 'mode:resume'));
+
+    await Agent.prototype.handleUpdate.call(agent, { message: { chat: { id: 42 }, text: '/maintenance' } });
+    assert.match(sent.at(-1).text, /Обслуживание выполнено:.*бэкап сделан/);
+  } finally {
+    db.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('scanOnce прерывает внешний цикл запросов при капче и помечает результат captcha=true', async () => {
+  const db = openDb(':memory:');
+  const visitedUrls = [];
+  let broughtToFront = 0;
+  const searchPage = {
+    url: () => visitedUrls.at(-1) || 'https://hh.ru/',
+    async goto(url) { visitedUrls.push(url); },
+    async waitForTimeout() {},
+    async bringToFront() { broughtToFront++; },
+    locator: (selector) => ({
+      async innerText() {
+        return selector === 'body' ? 'Подтвердите, что вы не робот' : '';
+      },
+      async count() { return 0; }
+    })
+  };
+  const agent = {
+    db,
+    cfg: {
+      hh: { base: 'https://hh.ru', area: '113', queriesAI: ['ai-first', 'ai-second', 'ai-third'], pages: 1, remoteOnly: false },
+      threshold: 70
+    },
+    skipExamples: () => [],
+    enqueueApply: () => {},
+    rescoreBorderline: async () => [],
+    page: async () => searchPage,
+    send: async () => true,
+    log: () => {}
+  };
+
+  try {
+    const res = await Agent.prototype.scanOnce.call(agent);
+    assert.equal(res.captcha, true);
+    assert.match(res.captchaReason, /ai-first/);
+    assert.equal(visitedUrls.length, 1);
+    assert.equal(broughtToFront, 1);
+  } finally {
+    db.close();
   }
 });

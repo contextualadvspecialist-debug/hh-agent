@@ -76,6 +76,15 @@ CREATE INDEX IF NOT EXISTS idx_app_applied_at ON applications(applied_at);
 CREATE INDEX IF NOT EXISTS idx_app_hh_status ON applications(hh_status);
 CREATE INDEX IF NOT EXISTS idx_msg_chat ON messages(chat_id);
 CREATE INDEX IF NOT EXISTS idx_chat_forms_status ON chat_forms(status);
+
+CREATE TABLE IF NOT EXISTS llm_usage (
+  day TEXT PRIMARY KEY,
+  requests INTEGER DEFAULT 0,
+  prompt_tokens INTEGER DEFAULT 0,
+  completion_tokens INTEGER DEFAULT 0,
+  total_tokens INTEGER DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 `;
 
 export function openDb(file = ':memory:') {
@@ -191,6 +200,37 @@ export function markApplicationDelivered(db, vacancyId) {
     UPDATE applications SET status = 'applied', error = ''
     WHERE vacancy_id = ? AND status IN ('captcha', 'manual', 'error')
   `).run(vacancyId).changes > 0;
+}
+
+export function markApplicationSkipped(db, vacancyId) {
+  return db.prepare(`
+    UPDATE applications SET status = 'skipped'
+    WHERE vacancy_id = ? AND status IN ('captcha', 'manual', 'error') AND COALESCE(hh_status, '') = ''
+  `).run(vacancyId).changes > 0;
+}
+
+export function reconcileDeliveredApplications(db) {
+  const rows = db.prepare(`
+    SELECT vacancy_id FROM applications
+    WHERE status IN ('captcha', 'manual', 'error')
+      AND hh_status IN ('sent', 'viewed', 'invitation', 'rejected', 'hired')
+  `).all();
+  if (!rows.length) return 0;
+  const ts = now();
+  const updApp = db.prepare("UPDATE applications SET status = 'applied', error = '' WHERE vacancy_id = ?");
+  const updVac = db.prepare("UPDATE vacancies SET status = 'applied', updated_at = ? WHERE id = ?");
+  db.exec('BEGIN');
+  try {
+    for (const r of rows) {
+      updApp.run(r.vacancy_id);
+      updVac.run(ts, r.vacancy_id);
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return rows.length;
 }
 
 export function closeDb(db) {
@@ -351,6 +391,27 @@ export function archiveStaleNewVacancies(db, isoBefore) {
     SET status = 'stale', updated_at = ?
     WHERE status = 'new' AND found_at < ?
   `).run(now(), isoBefore).changes;
+}
+
+export function skipCompanyVacancies(db, company) {
+  const clean = String(company ?? '').trim().toLowerCase();
+  if (!clean) return 0;
+  const rows = db.prepare(`
+    SELECT id, company FROM vacancies
+    WHERE status IN ('new', 'notified', 'direct-pool')
+  `).all().filter((r) => String(r.company ?? '').trim().toLowerCase() === clean);
+  if (!rows.length) return 0;
+  const ts = now();
+  const upd = db.prepare("UPDATE vacancies SET status = 'skipped', updated_at = ? WHERE id = ?");
+  db.exec('BEGIN');
+  try {
+    for (const r of rows) upd.run(ts, r.id);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  return rows.length;
 }
 
 export function kvSet(db, k, v) {
@@ -526,4 +587,57 @@ export function purgeStaleKv(
     throw e;
   }
   return toDelete.length;
+}
+
+export function recordLlmUsage(db, {
+  day,
+  promptTokens = 0,
+  completionTokens = 0,
+  totalTokens = 0
+} = {}) {
+  const dayKey = String(day || '').trim() || now().slice(0, 10);
+  const p = Math.max(0, Number(promptTokens) || 0);
+  const c = Math.max(0, Number(completionTokens) || 0);
+  const t = Math.max(0, Number(totalTokens) || (p + c));
+  db.prepare(`
+    INSERT INTO llm_usage(day, requests, prompt_tokens, completion_tokens, total_tokens, updated_at)
+    VALUES (?, 1, ?, ?, ?, ?)
+    ON CONFLICT(day) DO UPDATE SET
+      requests = llm_usage.requests + 1,
+      prompt_tokens = llm_usage.prompt_tokens + excluded.prompt_tokens,
+      completion_tokens = llm_usage.completion_tokens + excluded.completion_tokens,
+      total_tokens = llm_usage.total_tokens + excluded.total_tokens,
+      updated_at = excluded.updated_at
+  `).run(dayKey, p, c, t, now());
+}
+
+export function getLlmUsageSummary(db, day) {
+  const dayKey = String(day || '').trim() || now().slice(0, 10);
+  const todayRow = db.prepare(`
+    SELECT requests, prompt_tokens AS promptTokens, completion_tokens AS completionTokens, total_tokens AS totalTokens
+    FROM llm_usage WHERE day = ?
+  `).get(dayKey);
+  const totalRow = db.prepare(`
+    SELECT
+      COALESCE(SUM(requests), 0) AS requests,
+      COALESCE(SUM(prompt_tokens), 0) AS promptTokens,
+      COALESCE(SUM(completion_tokens), 0) AS completionTokens,
+      COALESCE(SUM(total_tokens), 0) AS totalTokens
+    FROM llm_usage
+  `).get();
+  const empty = () => ({ requests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0 });
+  return {
+    today: todayRow ? {
+      requests: Number(todayRow.requests) || 0,
+      promptTokens: Number(todayRow.promptTokens) || 0,
+      completionTokens: Number(todayRow.completionTokens) || 0,
+      totalTokens: Number(todayRow.totalTokens) || 0
+    } : empty(),
+    total: totalRow ? {
+      requests: Number(totalRow.requests) || 0,
+      promptTokens: Number(totalRow.promptTokens) || 0,
+      completionTokens: Number(totalRow.completionTokens) || 0,
+      totalTokens: Number(totalRow.totalTokens) || 0
+    } : empty()
+  };
 }

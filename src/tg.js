@@ -96,6 +96,7 @@ export const MAIN_KEYBOARD = [
 export function vacancyKeyboard(v, cfg) {
   const rd = cfg.resumes.direct?.title ?? 'Директолог';
   const ra = cfg.resumes.ai?.title ?? 'AI';
+  const hasCompany = Boolean(String(v.company ?? '').trim());
   return [
     [
       { text: `🎯 Отклик · ${ra}`, callback_data: `ap:${v.id}:ai` },
@@ -107,7 +108,38 @@ export function vacancyKeyboard(v, cfg) {
     ],
     [
       { text: '🔗 Вакансия', url: v.url || `https://hh.ru/vacancy/${v.id}` },
-      { text: '🗑 Пропустить', callback_data: `sk:${v.id}` }
+      { text: '🗑 Пропустить', callback_data: `sk:${v.id}` },
+      ...(hasCompany ? [{ text: '🚫 Блок компании', callback_data: `blk:${v.id}` }] : [])
+    ]
+  ];
+}
+
+export function manualApplyKeyboard(v, cfg, { resumeKey = 'direct', retry = false } = {}) {
+  const id = String(v?.id ?? v);
+  const key = resumeKey === 'ai' ? 'ai' : 'direct';
+  const base = cfg?.hh?.base || 'https://hh.ru';
+  const vacUrl = v?.url || `${base}/vacancy/${id}`;
+  const responseUrl = `${base}/applicant/vacancy_response?vacancyId=${id}&startedWithQuestion=false&hhtmFrom=vacancy`;
+  if (retry) {
+    return [
+      [
+        { text: '🔁 Повторить', callback_data: `ap:${id}:${key}` },
+        { text: '✅ Уже откликнулся', callback_data: `apdone:${id}:${key}` }
+      ],
+      [
+        { text: '🔗 Вакансия', url: vacUrl },
+        { text: '🗑 Пропустить', callback_data: `apsk:${id}` }
+      ]
+    ];
+  }
+  return [
+    [
+      { text: '✅ Уже откликнулся', callback_data: `apdone:${id}:${key}` },
+      { text: '🗑 Пропустить', callback_data: `apsk:${id}` }
+    ],
+    [
+      { text: '🔗 Вакансия', url: vacUrl },
+      { text: '📝 Форма отклика', url: responseUrl }
     ]
   ];
 }

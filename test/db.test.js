@@ -2,12 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import {
-  openDb, closeDb, upsertVacancy, hasVacancy, setScore, getVacancy, listVacancies,
+  openDb, closeDb, upsertVacancy, hasVacancy, setScore, setVacancyStatus, getVacancy, listVacancies,
   recordApplication, countApplicationsSince, addMessage, listMessages, upsertChat, getChat, setChatVacancy,
   setVacancyFit, snippetFingerprint, listRuleScored, getApplication, markApplicationDelivered,
   setApplicationHhStatus, applicationFunnel, applicationFunnelByQuery, purgeLowVacancies, archiveStaleNewVacancies,
   recordChatForm, getChatForm, markChatHandled, getChatHandled, countPendingChatForms, listPendingChatForms,
-  countApplicationsByHhStatusSince, countPendingChats, purgeStaleKv, kvGet, kvSet
+  countApplicationsByHhStatusSince, countPendingChats, purgeStaleKv, kvGet, kvSet,
+  markApplicationSkipped, reconcileDeliveredApplications, skipCompanyVacancies,
+  recordLlmUsage, getLlmUsageSummary
 } from '../src/db.js';
 
 test('схема создаёт индексы для частых фильтров и сортировок', () => {
@@ -337,6 +339,70 @@ test('purgeStaleKv удаляет одноразовые и протухшие �
     assert.equal(kvGet(db, 'tgOffset'), '100');
     assert.equal(kvGet(db, 'notifiedChat:c1'), 'm1');
     assert.equal(kvGet(db, 'followupDone:c1'), 'sent');
+  } finally {
+    db.close();
+  }
+});
+
+test('markApplicationSkipped, reconcileDeliveredApplications и skipCompanyVacancies чистят зависшие отклики и вакансии компании', () => {
+  const db = openDb(':memory:');
+  try {
+    upsertVacancy(db, { id: '201', title: 'V1', company: 'ООО Альфа ', url: 'u1', snippet: 's' });
+    upsertVacancy(db, { id: '202', title: 'V2', company: 'ооо альфа', url: 'u2', snippet: 's' });
+    upsertVacancy(db, { id: '203', title: 'V3', company: 'ООО Альфа', url: 'u3', snippet: 's' });
+    upsertVacancy(db, { id: '204', title: 'V4', company: 'Бета', url: 'u4', snippet: 's' });
+
+    setVacancyStatus(db, '201', 'new');
+    setVacancyStatus(db, '202', 'notified');
+    setVacancyStatus(db, '203', 'applied');
+    setVacancyStatus(db, '204', 'manual');
+
+    recordApplication(db, { vacancyId: '201', resumeKey: 'ai', status: 'captcha', error: 'cap' });
+    setApplicationHhStatus(db, '201', 'sent'); // hh подтвердил доставку
+    recordApplication(db, { vacancyId: '204', resumeKey: 'direct', status: 'manual', error: 'анкета' });
+
+    // markApplicationSkipped не трогает 201 (есть hh_status), но пропускает 204.
+    assert.equal(markApplicationSkipped(db, '201'), false);
+    assert.equal(markApplicationSkipped(db, '204'), true);
+    assert.equal(db.prepare('SELECT status FROM applications WHERE vacancy_id = ?').get('204').status, 'skipped');
+
+    // reconcileDeliveredApplications чинит 201 ('captcha' + hh_status='sent' -> 'applied').
+    assert.equal(reconcileDeliveredApplications(db), 1);
+    const fixedApp = db.prepare('SELECT status, error FROM applications WHERE vacancy_id = ?').get('201');
+    assert.equal(fixedApp.status, 'applied');
+    assert.equal(fixedApp.error, '');
+    assert.equal(getVacancy(db, '201').status, 'applied');
+
+    // skipCompanyVacancies скрывает 202 ('notified'), но не трогает 201/203 ('applied').
+    const skipped = skipCompanyVacancies(db, 'ООО Альфа');
+    assert.equal(skipped, 1);
+    assert.equal(getVacancy(db, '202').status, 'skipped');
+    assert.equal(getVacancy(db, '203').status, 'applied');
+  } finally {
+    db.close();
+  }
+});
+
+test('recordLlmUsage и getLlmUsageSummary накапливают запросы по дням и суммарно', () => {
+  const db = openDb(':memory:');
+  try {
+    recordLlmUsage(db, { day: '2026-11-24', promptTokens: 1000, completionTokens: 200 });
+    recordLlmUsage(db, { day: '2026-11-25', promptTokens: 500, completionTokens: 100, totalTokens: 600 });
+    recordLlmUsage(db, { day: '2026-11-25', promptTokens: 250, completionTokens: 50 });
+
+    const summary = getLlmUsageSummary(db, '2026-11-25');
+    assert.deepEqual(summary.today, {
+      requests: 2,
+      promptTokens: 750,
+      completionTokens: 150,
+      totalTokens: 900
+    });
+    assert.deepEqual(summary.total, {
+      requests: 3,
+      promptTokens: 1750,
+      completionTokens: 350,
+      totalTokens: 2100
+    });
   } finally {
     db.close();
   }

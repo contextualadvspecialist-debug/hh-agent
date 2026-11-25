@@ -1,10 +1,11 @@
 import {
   getVacancy, countVacanciesSince, countApplicationsSince, countApplicationsByHhStatus,
   countApplicationsByHhStatusSince, applicationFunnel, applicationFunnelByQuery,
-  countPendingChatForms, listPendingChatForms, countPendingChats, kvGet
+  countPendingChatForms, listPendingChatForms, countPendingChats, kvGet, getLlmUsageSummary
 } from './db.js';
 import { withinWindow } from './schedule.js';
 import { esc } from './tg.js';
+import { localDayKey, getPauseState } from './agent-ops.js';
 
 const SEEN_BY_EMPLOYER = ['viewed', 'invitation', 'rejected', 'hired'];
 const POSITIVE = ['invitation', 'hired'];
@@ -66,6 +67,8 @@ export function statusView(agent, now = new Date()) {
   const lastChats = kvGet(agent.db, 'lastChatsCheck', '');
   const lastStatus = kvGet(agent.db, 'lastStatusCheck', '');
   const authPaused = kvGet(agent.db, 'authAlertActive', '') === '1';
+  const pause = typeof agent.pauseModes === 'function' ? agent.pauseModes() : getPauseState(agent.db);
+  const paused = Boolean(pause?.scan || pause?.apply);
 
   const w = agent.cfg?.limits?.sendWindow;
   const winText = w ? `${w.from ?? 10}:00–${w.to ?? 19}:00` : '10:00–19:00';
@@ -82,6 +85,10 @@ export function statusView(agent, now = new Date()) {
     `Ожидают ответа: чаты <b>${pendingChats}</b> · анкеты <b>${pendingForms}</b>`,
     `Проверки: скан ${esc(formatCheckTime(lastScan, now))} · чаты ${esc(formatCheckTime(lastChats, now))} · статусы ${esc(formatCheckTime(lastStatus, now))}`
   ];
+  const pausedLabels = [];
+  if (pause?.scan) pausedLabels.push('автоскан');
+  if (pause?.apply) pausedLabels.push('отклики');
+  if (pausedLabels.length) lines.push(`⏸ <b>На паузе:</b> ${pausedLabels.join(' · ')} (/resume)`);
   if (authPaused) lines.push('🔐 <b>Сессия hh.ru на паузе</b> — нужен повторный вход и /restart.');
   if (errEntries.length) lines.push(`⚠️ Сбои планировщика: ${esc(errEntries.join(', '))}`);
 
@@ -116,6 +123,10 @@ export function statusView(agent, now = new Date()) {
   } else {
     lines.push('', 'Очередь откликов пуста.');
   }
+  keyboard.push([
+    { text: paused ? '▶️ Возобновить' : '⏸ Пауза', callback_data: paused ? 'mode:resume' : 'mode:pause' },
+    { text: '🧹 Обслуживание', callback_data: 'mode:maint' }
+  ]);
 
   return {
     text: lines.join('\n'),
@@ -124,7 +135,8 @@ export function statusView(agent, now = new Date()) {
     daily,
     queueLength: queue.length,
     pendingChats,
-    pendingForms
+    pendingForms,
+    pause: { scan: Boolean(pause?.scan), apply: Boolean(pause?.apply) }
   };
 }
 
@@ -198,7 +210,25 @@ export function buildStatsText(agent) {
     .filter((g) => g.key !== '—' && g.total >= 3)
     .slice(0, 6);
 
-  if (!byResume.length) return '📊 Откликов пока нет — статистика появится после первых отправок.';
+  let llmSummary = null;
+  try {
+    llmSummary = getLlmUsageSummary(agent.db, localDayKey());
+  } catch (err) {
+    agent.log?.(`stats llm_usage: ${err?.message || err}`);
+  }
+  const fmtInt = (n) => Number(n || 0).toLocaleString('ru-RU');
+  const llmLines = llmSummary?.total?.requests > 0
+    ? [
+        '<b>Расход LLM</b>',
+        `Сегодня: ${llmSummary.today.requests} запр. · ${fmtInt(llmSummary.today.totalTokens)} ток. (${fmtInt(llmSummary.today.promptTokens)} in / ${fmtInt(llmSummary.today.completionTokens)} out)`,
+        `Всего: ${llmSummary.total.requests} запр. · ${fmtInt(llmSummary.total.totalTokens)} ток. (${fmtInt(llmSummary.total.promptTokens)} in / ${fmtInt(llmSummary.total.completionTokens)} out)`
+      ]
+    : [];
+
+  if (!byResume.length) {
+    const emptyText = '📊 Откликов пока нет — статистика появится после первых отправок.';
+    return llmLines.length ? `${emptyText}\n\n${llmLines.join('\n')}` : emptyText;
+  }
 
   const totals = byResume.reduce(
     (acc, g) => ({
@@ -222,6 +252,7 @@ export function buildStatsText(agent) {
     parts.push('', '<b>По поисковым запросам</b>');
     for (const g of byQuery) parts.push(line(esc(g.key), g));
   }
+  if (llmLines.length) parts.push('', ...llmLines);
   if (totals.total < 10) parts.push('', '<i>Выборка маленькая — выводы делать рано.</i>');
   return parts.join('\n');
 }

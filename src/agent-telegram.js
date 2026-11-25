@@ -1,6 +1,7 @@
 import {
-  upsertVacancy, setScore, setVacancyStatus, listVacancies,
-  setChatDraft, kvGet, kvSet, archiveStaleNewVacancies
+  upsertVacancy, setScore, setVacancyStatus, listVacancies, getVacancy,
+  setChatDraft, kvGet, kvSet, archiveStaleNewVacancies, recordApplication,
+  markApplicationSkipped, skipCompanyVacancies
 } from './db.js';
 import { getVacancyDetails } from './hh-search.js';
 import { ruleScore } from './score.js';
@@ -9,6 +10,22 @@ import { esc, MAIN_KEYBOARD, isOwnerUpdate, chatIdOf } from './tg.js';
 import { sendStatus, editStatusMessage, sendPendingForms } from './agent-analytics.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function dropFromQueue(agent, predicate) {
+  if (!Array.isArray(agent.queue) || !agent.queue.length) return 0;
+  const next = agent.queue.filter((j) => !predicate(j));
+  const removed = agent.queue.length - next.length;
+  if (removed > 0) {
+    agent.queue.splice(0, agent.queue.length, ...next);
+    agent.saveQueue?.();
+  }
+  return removed;
+}
+
+function formatMaintenanceReport(r) {
+  return `🧹 <b>Обслуживание выполнено:</b> бэкап ${esc(r.backup)}, удалено low ${r.purged}, `
+    + `устаревших new в архив ${r.staleNew}, kv ${r.kvPurged}, вкладок закрыто ${r.pagesRecycled}.`;
+}
 
 export const telegramPollBackoffMs = (failures) =>
   Math.min(5000 * Math.pow(1.5, Math.min(Math.max(failures, 1) - 1, 6)), 60000);
@@ -63,13 +80,63 @@ export async function handleTelegramUpdate(agent, update) {
         await agent.submitQuestions(a, b);
       } else if (cmd === 'sk' && idOk(a)) {
         setVacancyStatus(agent.db, a, 'skipped');
-        agent.rememberSkip(a);
+        markApplicationSkipped(agent.db, a);
+        dropFromQueue(agent, (j) => String(j.vacancyId) === a);
+        agent.rememberSkip?.(a);
         await finishCard(agent, q.message, `🗑 <b>Пропущено</b> (${esc(a)})`);
+      } else if (cmd === 'apdone' && idOk(a)) {
+        const key = resumeOk(b) ? b : 'direct';
+        const v = getVacancy(agent.db, a);
+        const resumeId = agent.cfg?.resumes?.[key]?.id ?? '';
+        recordApplication(agent.db, { vacancyId: a, resumeKey: key, resumeId, letter: '', status: 'applied', error: '' });
+        setVacancyStatus(agent.db, a, 'applied');
+        dropFromQueue(agent, (j) => String(j.vacancyId) === a);
+        const label = v?.title ? `<b>${esc(v.title)}</b>` : `вакансия ${esc(a)}`;
+        await finishCard(agent, q.message, `✅ <b>Отклик отмечен как отправленный:</b> ${label}`);
+      } else if (cmd === 'apsk' && idOk(a)) {
+        setVacancyStatus(agent.db, a, 'skipped');
+        markApplicationSkipped(agent.db, a);
+        agent.rememberSkip?.(a);
+        dropFromQueue(agent, (j) => String(j.vacancyId) === a);
+        await finishCard(agent, q.message, `🗑 <b>Отклик пропущен</b> (${esc(a)})`);
+      } else if (cmd === 'blk' && idOk(a)) {
+        const v = getVacancy(agent.db, a);
+        if (!v?.company) {
+          await finishCard(agent, q.message, `⚠️ Не найдено название компании для ${esc(a)}.`);
+        } else {
+          const company = String(v.company).trim();
+          agent.blockCompany(company);
+          setVacancyStatus(agent.db, a, 'skipped');
+          markApplicationSkipped(agent.db, a);
+          agent.rememberSkip?.(a);
+          const closed = skipCompanyVacancies(agent.db, company);
+          const norm = company.toLowerCase();
+          dropFromQueue(agent, (j) => {
+            if (String(j.vacancyId) === a) return true;
+            const jv = getVacancy(agent.db, String(j.vacancyId));
+            return Boolean(jv?.company && jv.company.trim().toLowerCase() === norm);
+          });
+          const extra = closed > 0 ? ` Скрыто ещё вакансий: ${closed}.` : '';
+          await finishCard(agent, q.message, `🚫 <b>Компания «${esc(company)}» в чёрном списке.</b>${extra}`);
+        }
+      } else if (cmd === 'mode' && (a === 'pause' || a === 'resume')) {
+        const pausing = a === 'pause';
+        agent.setPaused?.({ scan: pausing, apply: pausing });
+        const note = pausing
+          ? '⏸ <b>Пауза включена</b> (автоскан и отклики).'
+          : '▶️ <b>Пауза снята</b> — автоскан и отклики возобновлены.';
+        await editStatusMessage(agent, q.message, note);
+      } else if (cmd === 'mode' && a === 'maint') {
+        if (typeof agent.maintenance !== 'function') {
+          await agent.send('⚠️ Обслуживание недоступно.');
+        } else {
+          const runMaint = () => agent.maintenance();
+          const r = typeof agent.lock === 'function' ? await agent.lock('maintenance', runMaint) : await runMaint();
+          await editStatusMessage(agent, q.message, formatMaintenanceReport(r));
+        }
       } else if (cmd === 'qdrop' && idOk(a)) {
-        const idx = Array.isArray(agent.queue) ? agent.queue.findIndex((j) => String(j.vacancyId) === a) : -1;
-        if (idx >= 0) {
-          agent.queue.splice(idx, 1);
-          agent.saveQueue?.();
+        const removed = dropFromQueue(agent, (j) => String(j.vacancyId) === a);
+        if (removed > 0) {
           await editStatusMessage(agent, q.message, `🗑 <b>Убрано из очереди</b> (${esc(a)})`);
         } else {
           await editStatusMessage(agent, q.message, `ℹ️ Позиции ${esc(a)} уже нет в очереди.`);
@@ -152,7 +219,8 @@ export async function handleTelegramUpdate(agent, update) {
       '/scan — проверить выдачу сейчас (AI)\n/direct — директ-пул по запросу (Яндекс Директ)\n' +
       '/more — показать отложенные подходящие вакансии\n' +
       '/chats — проверить чаты\n/forms — незаполненные внешние анкеты\n/statuses — статусы откликов (просмотрено/приглашение/отказ)\n' +
-      '/digest — сводка за день и по воронке\n/status — очередь, ожидания и проверки\n/stats — конверсия по резюме и запросам\n/restart — перезапустить агента\n' +
+      '/digest — сводка за день и по воронке\n/status — очередь, ожидания и проверки\n/stats — конверсия и расход LLM\n' +
+      '/pause [scan|apply] · /resume — пауза и возобновление фона\n/maintenance — бэкап и чистка базы/вкладок\n/restart — перезапустить агента\n' +
       '/block Компания — в чёрный список\n/blocked — список\n/unblock Компания — убрать\n' +
       'Или пришлите ссылку на вакансию — подготовлю карточку с откликом.',
       undefined,
@@ -222,6 +290,35 @@ export async function handleTelegramUpdate(agent, update) {
   }
   if (text === '/stats') {
     await agent.send(agent.statsText());
+    return;
+  }
+  const pauseCmd = text.match(/^\/(pause|resume)(?:\s+(\S+))?$/i);
+  if (pauseCmd) {
+    const pausing = pauseCmd[1].toLowerCase() === 'pause';
+    const target = (pauseCmd[2] ?? 'all').toLowerCase();
+    if (!['all', 'scan', 'apply'].includes(target)) {
+      await agent.send('Используйте: /pause [scan|apply|all] или /resume [scan|apply|all].');
+      return;
+    }
+    const patch = target === 'all'
+      ? { scan: pausing, apply: pausing }
+      : target === 'scan'
+        ? { scan: pausing }
+        : { apply: pausing };
+    const state = agent.setPaused(patch);
+    const what = target === 'all' ? 'автоскан и отклики' : target === 'scan' ? 'автоскан' : 'отклики';
+    const remaining = [state.scan && 'автоскан', state.apply && 'отклики'].filter(Boolean);
+    await agent.send(
+      pausing
+        ? `⏸ <b>На паузе:</b> ${what}. Вернуть: /resume${target === 'all' ? '' : ` ${target}`}`
+        : `▶️ <b>Возобновлено:</b> ${what}.${remaining.length ? ` На паузе остаётся: ${remaining.join(', ')}.` : ''}`
+    );
+    return;
+  }
+  if (text === '/maintenance') {
+    const runMaint = () => agent.maintenance();
+    const r = typeof agent.lock === 'function' ? await agent.lock('maintenance', runMaint) : await runMaint();
+    await agent.send(formatMaintenanceReport(r));
     return;
   }
   if (text === '/restart') {

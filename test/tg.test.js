@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { excerpt, vacancyText, truncateHtml, isOwnerUpdate, MAIN_KEYBOARD } from '../src/tg.js';
+import {
+  excerpt, vacancyText, truncateHtml, isOwnerUpdate, MAIN_KEYBOARD,
+  vacancyKeyboard, manualApplyKeyboard
+} from '../src/tg.js';
 
 test('excerpt режет длинный текст по границе слова', () => {
   const text = `${'слово '.repeat(40)}конец`;
@@ -62,4 +65,29 @@ test('MAIN_KEYBOARD содержит основные команды меню', 
   for (const cmd of ['/scan', '/direct', '/more', '/chats', '/forms', '/statuses', '/digest', '/stats', '/status', '/blocked', '/help']) {
     assert.ok(buttons.includes(cmd), `не найдена кнопка ${cmd}`);
   }
+});
+
+test('vacancyKeyboard добавляет кнопку blk:<id> в пределах лимита callback_data', () => {
+  const cfg = { resumes: { ai: { title: 'AI' }, direct: { title: 'Директолог' } } };
+  const withCompany = vacancyKeyboard({
+    id: '138197375',
+    company: 'Очень длинное название компании ООО Международные Технологии Автоматизации'
+  }, cfg);
+  const row3 = withCompany[2];
+  assert.equal(row3.length, 3);
+  assert.equal(row3[2].callback_data, 'blk:138197375');
+  assert.ok(Buffer.byteLength(row3[2].callback_data, 'utf8') <= 64);
+
+  const withoutCompany = vacancyKeyboard({ id: '138197375', company: '  ' }, cfg);
+  assert.equal(withoutCompany[2].length, 2);
+});
+
+test('manualApplyKeyboard формирует кнопки для ручного отклика и ретрая', () => {
+  const cfg = { hh: { base: 'https://spb.hh.ru' } };
+  const manual = manualApplyKeyboard({ id: '9911', url: 'https://spb.hh.ru/vacancy/9911' }, cfg, { resumeKey: 'ai' });
+  assert.deepEqual(manual.flat().map((b) => b.callback_data).filter(Boolean), ['apdone:9911:ai', 'apsk:9911']);
+  assert.ok(manual.flat().some((b) => b.url && b.url.includes('vacancy_response?vacancyId=9911')));
+
+  const retry = manualApplyKeyboard({ id: '9911' }, cfg, { resumeKey: 'direct', retry: true });
+  assert.deepEqual(retry.flat().map((b) => b.callback_data).filter(Boolean), ['ap:9911:direct', 'apdone:9911:direct', 'apsk:9911']);
 });

@@ -21,6 +21,43 @@ export function alertCooldownMs(agent) {
   return (agent.cfg?.limits?.alertCooldownHours ?? 3) * 3600_000;
 }
 
+export function getPauseState(db) {
+  try {
+    const raw = JSON.parse(kvGet(db, 'pauseModes', '{}'));
+    return { scan: Boolean(raw?.scan), apply: Boolean(raw?.apply) };
+  } catch {
+    return { scan: false, apply: false };
+  }
+}
+
+export function setPauseState(db, patch = {}) {
+  const prev = getPauseState(db);
+  const next = {
+    scan: patch.scan !== undefined ? Boolean(patch.scan) : prev.scan,
+    apply: patch.apply !== undefined ? Boolean(patch.apply) : prev.apply,
+    updatedAt: new Date().toISOString()
+  };
+  kvSet(db, 'pauseModes', JSON.stringify({ scan: next.scan, apply: next.apply, updatedAt: next.updatedAt }));
+  return { scan: next.scan, apply: next.apply };
+}
+
+export async function alertCaptcha(agent, kind, reason = '') {
+  const key = `lastCaptchaAlert:${kind}`;
+  const cooldown = (agent.cfg?.limits?.captchaAlertCooldownMinutes ?? 60) * 60_000;
+  const last = Number(kvGet(agent.db, key, 0)) || 0;
+  const now = Date.now();
+  if (last && now - last < cooldown) return false;
+  kvSet(agent.db, key, String(now));
+  const label = SCHEDULER_LABELS[kind] || kind;
+  const nextCmd = kind === 'scan' ? '/scan' : kind === 'chats' ? '/chats' : '/statuses';
+  await agent.send(
+    `🤖 <b>Капча в фоне (${esc(label)})</b>\n`
+    + (reason ? `Остановлено на этапе: ${esc(reason)}\n\n` : '\n')
+    + `Решите капчу в Chrome, затем при необходимости проверьте ${nextCmd}.`
+  );
+  return true;
+}
+
 export async function alertAuthLost(agent, reason = '') {
   kvSet(agent.db, 'authAlertActive', '1');
   const last = Number(kvGet(agent.db, 'lastAuthAlertAt', 0)) || 0;
@@ -85,6 +122,9 @@ export async function recordSchedulerError(agent, kind, error) {
 export async function runScheduledTask(agent, kind, fn) {
   try {
     const res = await fn();
+    if (res?.captcha) {
+      await alertCaptcha(agent, kind, res.captchaReason || res.errors?.[0] || '');
+    }
     if (kind === 'scan' && res && res.totalBatches > 0 && res.errors?.length >= res.totalBatches && res.found === 0) {
       await recordSchedulerError(agent, 'scan', new Error(res.errors[0] || 'все поисковые запросы завершились ошибкой'));
       return res;
@@ -98,10 +138,14 @@ export async function runScheduledTask(agent, kind, fn) {
     return res;
   } catch (e) {
     agent.log?.(`${kind}: ${e.message}`);
+    if (e?.name === 'CaptchaError') {
+      await alertCaptcha(agent, kind, e.message);
+      return null;
+    }
     const errFn = typeof agent.recordSchedulerError === 'function'
       ? () => agent.recordSchedulerError(kind, e)
       : () => recordSchedulerError(agent, kind, e);
-    await errFn().catch(() => {});
+    await errFn().catch((err) => agent.log?.(`scheduler alert: ${err?.message || err}`));
     return null;
   }
 }
