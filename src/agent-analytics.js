@@ -1,6 +1,6 @@
 import {
   getVacancy, countVacanciesSince, countApplicationsSince, countApplicationsByHhStatus,
-  countApplicationsByHhStatusSince, applicationFunnel, applicationFunnelByQuery,
+  countApplicationsByHhStatusSince, listApplicationsByHhStatus, applicationFunnel, applicationFunnelByQuery,
   countPendingChatForms, listPendingChatForms, countPendingChats, kvGet, getLlmUsageSummary
 } from './db.js';
 import { withinWindow } from './schedule.js';
@@ -168,9 +168,10 @@ export async function buildDigest(agent) {
   const invitationsToday = countApplicationsByHhStatusSince(agent.db, 'invitation', since);
   const rejectedToday = countApplicationsByHhStatusSince(agent.db, 'rejected', since);
 
-  const pending = countApplicationsByHhStatus(agent.db, 'sent')
-    + countApplicationsByHhStatus(agent.db, 'viewed')
+  const viewedPending = countApplicationsByHhStatus(agent.db, 'viewed');
+  const unreadPending = countApplicationsByHhStatus(agent.db, 'sent')
     + countApplicationsByHhStatus(agent.db, '');
+  const pending = viewedPending + unreadPending;
   const invitations = countApplicationsByHhStatus(agent.db, 'invitation');
   const rejected = countApplicationsByHhStatus(agent.db, 'rejected');
   const pendingForms = countPendingChatForms(agent.db);
@@ -183,7 +184,7 @@ export async function buildDigest(agent) {
     `Откликов: <b>${applied}</b> из ${agent.cfg.limits.dailyApplications}\n` +
     `Новых приглашений: <b>${invitationsToday}</b> · отказов: <b>${rejectedToday}</b>\n\n` +
     '<b>Всего в воронке</b>\n' +
-    `Ждут ответа: <b>${pending}</b>\n` +
+    `Ждут ответа: <b>${pending}</b> (👀 просмотрено: <b>${viewedPending}</b> · ⏳ не просмотрено: <b>${unreadPending}</b>)\n` +
     `Приглашения: <b>${invitations}</b> · отказы: <b>${rejected}</b>\n` +
     (pendingForms > 0 ? `Анкеты ждут заполнения: <b>${pendingForms}</b>\n` : '') +
     (pendingChats > 0 ? `Чаты ждут ответа: <b>${pendingChats}</b>\n` : '') +
@@ -195,12 +196,55 @@ export async function buildDigest(agent) {
     invitationsToday,
     rejectedToday,
     pending,
+    viewedPending,
+    unreadPending,
     invitations,
     rejected,
     pendingForms,
     pendingChats,
     sent
   };
+}
+
+function formatStatusRow(row, baseUrl) {
+  const title = row.title || `Вакансия ${row.vacancy_id}`;
+  const company = row.company ? ` — ${esc(row.company)}` : '';
+  const url = row.url || `${baseUrl}/vacancy/${row.vacancy_id}`;
+  const rawTs = row.hh_status_at || row.applied_at || '';
+  const d = rawTs ? new Date(rawTs) : null;
+  const date = d && Number.isFinite(d.getTime())
+    ? ` (${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')})`
+    : '';
+  return `• <a href="${esc(url)}">${esc(title)}</a>${company}${date}`;
+}
+
+export function buildStatusesText(db, syncResult = {}, cfg = {}) {
+  const baseUrl = cfg?.hh?.base || 'https://hh.ru';
+  const viewedCount = countApplicationsByHhStatus(db, 'viewed');
+  const unreadCount = countApplicationsByHhStatus(db, 'sent') + countApplicationsByHhStatus(db, '');
+  const viewedRows = listApplicationsByHhStatus(db, ['viewed'], 8);
+  const unreadRows = listApplicationsByHhStatus(db, ['sent', ''], 8);
+
+  const lines = [
+    `Переговоры: ${syncResult.total ?? 0} откликов, изменений ${syncResult.changed ?? 0}, добавлено ${syncResult.adopted ?? 0}.`,
+    '',
+    `👀 <b>Просмотрены, без ответа (${viewedCount}):</b>`
+  ];
+  if (viewedRows.length) {
+    lines.push(...viewedRows.map((r) => formatStatusRow(r, baseUrl)));
+    if (viewedCount > viewedRows.length) lines.push(`<i>…и ещё ${viewedCount - viewedRows.length}</i>`);
+  } else {
+    lines.push('— нет');
+  }
+
+  lines.push('', `⏳ <b>Ещё не просмотрены (${unreadCount}):</b>`);
+  if (unreadRows.length) {
+    lines.push(...unreadRows.map((r) => formatStatusRow(r, baseUrl)));
+    if (unreadCount > unreadRows.length) lines.push(`<i>…и ещё ${unreadCount - unreadRows.length}</i>`);
+  } else {
+    lines.push('— нет');
+  }
+  return lines.join('\n');
 }
 
 export function buildStatsText(agent) {

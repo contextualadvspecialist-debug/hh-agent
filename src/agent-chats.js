@@ -1,15 +1,15 @@
 import { CaptchaError } from './hh-search.js';
-import { listUnreadChats, listAllChats, readChat, sendChatMessage, cleanVacancyTitle, extractFormLinks } from './hh-chats.js';
+import { listUnreadChats, listAllChats, readChat, sendChatMessage, findChatIdForVacancy, cleanVacancyTitle, extractFormLinks } from './hh-chats.js';
 import { listNegotiations } from './hh-status.js';
 import { proposeFollowups } from './followup.js';
-import { esc, chatReplyKeyboard } from './tg.js';
+import { esc, chatReplyKeyboard, followupVacancyKeyboard } from './tg.js';
 import {
   setVacancyStatus, getVacancy, upsertChat, setChatVacancy, setChatDraft,
   getChat, addMessage, kvGet, kvSet, setApplicationHhStatus, listApplications,
   adoptNegotiation, markApplicationDelivered, reconcileDeliveredApplications,
   recordChatForm, getChatForm, markChatHandled, getChatHandled
 } from './db.js';
-import { draftFormDoneReply } from './agent-prompts.js';
+import { draftFormDoneReply, draftVacancyFollowup } from './agent-prompts.js';
 import { localDayKey } from './agent-ops.js';
 
 export function chatRetryState(db) {
@@ -353,6 +353,14 @@ export async function checkStatusesOnce(agent) {
   let adopted = 0;
   for (const item of items) {
     const app = byId.get(item.id);
+    if (item.chatId && /^\d+$/.test(item.chatId)) {
+      upsertChat(agent.db, {
+        id: item.chatId,
+        title: item.company || app?.company || '',
+        vacancy: item.title || app?.title || '',
+        vacancyId: item.id
+      });
+    }
     if (!app) {
       adoptNegotiation(agent.db, { ...item, url: `${agent.cfg.hh.base}/vacancy/${item.id}` });
       adopted++;
@@ -366,10 +374,19 @@ export async function checkStatusesOnce(agent) {
     if (app.hh_status === item.status) continue;
     setApplicationHhStatus(agent.db, item.id, item.status);
     changed++;
+    const title = app.title || item.title || `Вакансия ${item.id}`;
+    const company = app.company || item.company || '';
+    const vacUrl = app.url || `${agent.cfg.hh.base}/vacancy/${item.id}`;
+    const label = `<b>${esc(title)}</b>${company ? ` — ${esc(company)}` : ''}`;
+    const vacLink = `\n<a href="${esc(vacUrl)}">Открыть вакансию</a>`;
     if (item.status === 'invitation') {
-      await agent.send(`🎉 Приглашение: <b>${esc(app.title || item.title)}</b> — ${esc(app.company || '')}`);
+      await agent.send(`🎉 Приглашение: ${label}${vacLink}`);
+    } else if (item.status === 'hired') {
+      await agent.send(`🥳 Принят / оффер: ${label}${vacLink}`);
     } else if (item.status === 'rejected') {
-      await agent.send(`❌ Отказ: <b>${esc(app.title || item.title)}</b> — ${esc(app.company || '')}`);
+      await agent.send(`❌ Отказ: ${label}`);
+    } else if (item.status === 'viewed') {
+      await agent.send(`👀 Просмотрен отклик: ${label}${vacLink}`);
     }
   }
 
@@ -461,6 +478,73 @@ export async function redraft(agent, chatId, { hint = '', kind = 'chat' } = {}) 
   );
   if (msg?.message_id) {
     kvSet(agent.db, `chatMsg:${msg.message_id}`, JSON.stringify({ chatId: String(chatId), kind: mode, at: Date.now() }));
+  }
+  return msg;
+}
+
+export async function sendVacancyFollowup(agent, vacancyId, { notify = true } = {}) {
+  const result = await agent.lock('chats', async () => {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(kvGet(agent.db, `followupVacDraft:${vacancyId}`, 'null'));
+    } catch { /* битый черновик */ }
+    const text = String(parsed?.text ?? '').trim();
+    if (!text) throw new Error('нет черновика follow-up');
+
+    const vac = getVacancy(agent.db, vacancyId);
+    const existing = agent.db.prepare('SELECT id, title FROM chats WHERE vacancy_id = ? LIMIT 1').get(vacancyId);
+    const page = await agent.page('chats');
+    const chatId = existing?.id || await findChatIdForVacancy(page, agent.cfg, vacancyId);
+    if (!chatId) {
+      throw new Error('Чат по этому отклику на hh.ru пока не найден — откройте вакансию по ссылке и напишите вручную.');
+    }
+
+    const title = parsed?.employer || existing?.title || vac?.company || 'Работодатель';
+    const vacancy = parsed?.vacancy || vac?.title || '';
+    upsertChat(agent.db, { id: chatId, title, vacancy, vacancyId });
+    setChatDraft(agent.db, chatId, text);
+    await sendChatMessage(page, agent.cfg, chatId, text);
+    addMessage(agent.db, {
+      chatId,
+      extId: `local-${Date.now()}`,
+      direction: 'out',
+      author: '',
+      text,
+      ts: new Date().toISOString()
+    });
+    markChatHandled(agent.db, chatId, { state: 'handled' });
+    kvSet(agent.db, `followupDone:${chatId}`, `sent:${new Date().toISOString()}`);
+    kvSet(agent.db, `followupVacDraft:${vacancyId}`, '');
+    return { chatId, title };
+  });
+  if (notify) await agent.send(`📨 Отправлено в чат <b>${esc(result.title || vacancyId)}</b>`);
+  return result;
+}
+
+export async function redraftVacancyFollowup(agent, vacancyId, { hint = '' } = {}) {
+  const draft = await draftVacancyFollowup(agent, vacancyId, hint);
+  const vac = getVacancy(agent.db, vacancyId);
+  let prev = {};
+  try {
+    prev = JSON.parse(kvGet(agent.db, `followupVacDraft:${vacancyId}`, '{}')) || {};
+  } catch { /* игнорируем */ }
+  const employer = prev.employer || vac?.company || 'Работодатель';
+  const vacancy = prev.vacancy || vac?.title || '';
+  const vacancyUrl = prev.vacancyUrl || vac?.url || '';
+  kvSet(agent.db, `followupVacDraft:${vacancyId}`, JSON.stringify({
+    text: draft,
+    employer,
+    vacancy,
+    vacancyUrl,
+    updatedAt: new Date().toISOString()
+  }));
+
+  const msg = await agent.send(
+    `🔄 Новый follow-up для <b>${esc(employer)}</b>${vacancy ? ` — ${esc(vacancy)}` : ''}:\n\n${esc(draft)}\n\n<i>Ответьте на это сообщение правкой — перепишу черновик.</i>`,
+    followupVacancyKeyboard(agent.cfg, vacancyId, vacancyUrl)
+  );
+  if (msg?.message_id) {
+    kvSet(agent.db, `chatMsg:${msg.message_id}`, JSON.stringify({ vacancyId: String(vacancyId), kind: 'followup-vac', at: Date.now() }));
   }
   return msg;
 }

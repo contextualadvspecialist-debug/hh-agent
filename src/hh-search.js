@@ -41,23 +41,8 @@ export async function getVacancyDetails(page, cfg, id) {
   }, id);
 }
 
-export async function searchQuery(page, cfg, query, pageNum = 0) {
-  const params = new URLSearchParams({
-    text: query,
-    order_by: 'publication_time',
-    items_on_page: String(cfg.hh.itemsOnPage ?? 50),
-    page: String(pageNum)
-  });
-  if (cfg.hh.remoteOnly) params.set('work_format', 'REMOTE');
-  if (cfg.hh.area) params.set('area', String(cfg.hh.area));
-
-  await page.goto(`${cfg.hh.base}/search/vacancy?${params}`, { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(2500);
-
-  const body = await safeBodyText(page);
-  if (CAPTCHA_TEXT.test(body)) throw new CaptchaError('капча на выдаче');
-
-  const items = await page.evaluate(() => {
+export async function collectSerpVacancies(page) {
+  return page.evaluate(() => {
     const norm = (s) => String(s ?? '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
     return Array.from(document.querySelectorAll('[data-qa="vacancy-serp__vacancy"]')).map((el) => {
       const a = el.querySelector('[data-qa="serp-item__title"]');
@@ -88,6 +73,39 @@ export async function searchQuery(page, cfg, query, pageNum = 0) {
       };
     }).filter((v) => v.id && v.title);
   });
+}
 
-  return items;
+async function fetchSerpPage(page, url, captchaMessage) {
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(2500);
+
+  const body = await safeBodyText(page);
+  if (CAPTCHA_TEXT.test(body)) throw new CaptchaError(captchaMessage);
+
+  return collectSerpVacancies(page);
+}
+
+export async function searchQuery(page, cfg, query, pageNum = 0) {
+  const params = new URLSearchParams({
+    text: query,
+    order_by: 'publication_time',
+    items_on_page: String(cfg.hh.itemsOnPage ?? 50),
+    page: String(pageNum)
+  });
+  if (cfg.hh.remoteOnly) params.set('work_format', 'REMOTE');
+  if (cfg.hh.area) params.set('area', String(cfg.hh.area));
+
+  return fetchSerpPage(page, `${cfg.hh.base}/search/vacancy?${params}`, 'капча на выдаче');
+}
+
+export async function searchResumeFeed(page, cfg, resumeId, pageNum = 0) {
+  const params = new URLSearchParams({
+    resume: String(resumeId),
+    order_by: 'publication_time',
+    items_on_page: String(cfg.hh.itemsOnPage ?? 50),
+    page: String(pageNum)
+  });
+  if (cfg.hh.remoteOnly) params.set('work_format', 'REMOTE');
+
+  return fetchSerpPage(page, `${cfg.hh.base}/search/vacancy?${params}`, 'капча на ленте рекомендаций');
 }

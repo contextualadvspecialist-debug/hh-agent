@@ -7,7 +7,8 @@ import { getVacancyDetails } from './hh-search.js';
 import { ruleScore } from './score.js';
 import { followupsSentToday, incrementFollowupsToday } from './followup.js';
 import { esc, MAIN_KEYBOARD, isOwnerUpdate, chatIdOf } from './tg.js';
-import { sendStatus, editStatusMessage, sendPendingForms } from './agent-analytics.js';
+import { sendStatus, editStatusMessage, sendPendingForms, buildStatusesText } from './agent-analytics.js';
+import { sendVacancyFollowup, redraftVacancyFollowup } from './agent-chats.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -157,9 +158,15 @@ export async function handleTelegramUpdate(agent, update) {
         agent.enqueueApply(a, b);
         await finishCard(agent, q.message, '🔁 <b>Повтор отклика поставлен в очередь.</b>');
       } else if (cmd === 'fu' && idOk(a)) {
-        const limit = agent.cfg.limits.dailyFollowups ?? 3;
+        const limit = agent.cfg.limits.dailyFollowups ?? 10;
         if (followupsSentToday(agent.db) >= limit) {
           await agent.send(`Дневной лимит follow-up (${limit}) исчерпан — отправлю завтра.`);
+        } else if (b === 'v') {
+          if (typeof agent.sendVacancyFollowup === 'function') await agent.sendVacancyFollowup(a, { notify: false });
+          else await sendVacancyFollowup(agent, a, { notify: false });
+          incrementFollowupsToday(agent.db);
+          kvSet(agent.db, `followupDone:v:${a}`, `sent:${new Date().toISOString()}`);
+          await finishCard(agent, q.message, '📨 <b>Follow-up отправлен в чат hh.</b>');
         } else {
           await agent.sendChatReply(a, { notify: false });
           incrementFollowupsToday(agent.db);
@@ -167,14 +174,24 @@ export async function handleTelegramUpdate(agent, update) {
           await finishCard(agent, q.message, '📨 <b>Follow-up отправлен в чат hh.</b>');
         }
       } else if (cmd === 'fusk' && idOk(a)) {
-        setChatDraft(agent.db, a, '');
-        kvSet(agent.db, `followupDone:${a}`, `skipped:${new Date().toISOString()}`);
+        if (b === 'v') {
+          kvSet(agent.db, `followupVacDraft:${a}`, '');
+          kvSet(agent.db, `followupDone:v:${a}`, `skipped:${new Date().toISOString()}`);
+        } else {
+          setChatDraft(agent.db, a, '');
+          kvSet(agent.db, `followupDone:${a}`, `skipped:${new Date().toISOString()}`);
+        }
         await finishCard(agent, q.message, '🗑 <b>Follow-up пропущен.</b>');
       } else if (cmd === 'send' && idOk(a)) {
         await agent.sendChatReply(a, { notify: false });
         await finishCard(agent, q.message, '📨 <b>Ответ отправлен в чат hh.</b>');
       } else if (cmd === 'redraft' && idOk(a)) {
-        await agent.redraft(a, { kind: b === 'fu' ? 'followup' : 'chat' });
+        if (b === 'fv') {
+          if (typeof agent.redraftVacancyFollowup === 'function') await agent.redraftVacancyFollowup(a);
+          else await redraftVacancyFollowup(agent, a);
+        } else {
+          await agent.redraft(a, { kind: b === 'fu' ? 'followup' : 'chat' });
+        }
       } else if (cmd === 'fmdone' && idOk(a)) {
         await agent.markFormDone(a, { replyInChat: false });
         await finishCard(agent, q.message, '✅ <b>Анкета отмечена как заполненная.</b>');
@@ -206,6 +223,14 @@ export async function handleTelegramUpdate(agent, update) {
     } catch { /* нет сохранённой ссылки на письмо */ }
     try {
       const chatRef = JSON.parse(kvGet(agent.db, `chatMsg:${parentId}`, 'null'));
+      if (chatRef?.kind === 'followup-vac' && chatRef?.vacancyId) {
+        if (typeof agent.redraftVacancyFollowup === 'function') {
+          await agent.redraftVacancyFollowup(chatRef.vacancyId, { hint: text.slice(0, 300) });
+        } else {
+          await redraftVacancyFollowup(agent, chatRef.vacancyId, { hint: text.slice(0, 300) });
+        }
+        return;
+      }
       if (chatRef?.chatId) {
         await agent.redraft(chatRef.chatId, { hint: text.slice(0, 300), kind: chatRef.kind === 'followup' ? 'followup' : 'chat' });
         return;
@@ -281,7 +306,7 @@ export async function handleTelegramUpdate(agent, update) {
   }
   if (text === '/statuses') {
     const r = await agent.checkStatuses();
-    await agent.send(`Переговоры: ${r.total} откликов, изменений ${r.changed}, добавлено ${r.adopted}.`);
+    await agent.send(buildStatusesText(agent.db, r, agent.cfg));
     return;
   }
   if (text === '/digest') {

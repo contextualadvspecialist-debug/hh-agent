@@ -177,6 +177,21 @@ export function chatReplyKeyboard(cfg, chatId, { hasDraft = true, retryLabel = '
   ];
 }
 
+export function followupVacancyKeyboard(cfg, vacancyId, vacancyUrl = '') {
+  const base = cfg?.hh?.base || 'https://hh.ru';
+  const url = vacancyUrl || `${base}/vacancy/${vacancyId}`;
+  return [
+    [
+      { text: '📨 Отправить', callback_data: `fu:${vacancyId}:v` },
+      { text: '🔄 Переписать', callback_data: `redraft:${vacancyId}:fv` }
+    ],
+    [
+      { text: '🗑 Пропустить', callback_data: `fusk:${vacancyId}:v` },
+      { text: '🔗 Вакансия', url }
+    ]
+  ];
+}
+
 const EXPERIENCE = {
   noExperience: 'без опыта',
   between1And3: '1–3 года',

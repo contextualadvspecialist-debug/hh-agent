@@ -31,6 +31,7 @@ import {
   refreshChatDirectory as _refreshChatDirectory, repairChatVacancies as _repairChatVacancies,
   checkChatsOnce as _checkChatsOnce, checkStatusesOnce as _checkStatusesOnce,
   notifyChat as _notifyChat, sendChatReply as _sendChatReply,
+  sendVacancyFollowup as _sendVacancyFollowup, redraftVacancyFollowup as _redraftVacancyFollowup,
   markFormDone as _markFormDone, markChatDone as _markChatDone, redraft as _redraft
 } from './agent-chats.js';
 import { telegramPollBackoffMs, handleTelegramUpdate, runBotLoop } from './agent-telegram.js';
@@ -472,6 +473,14 @@ export class Agent {
 
   async redraft(chatId, opts = {}) {
     return _redraft(this, chatId, opts);
+  }
+
+  async sendVacancyFollowup(vacancyId, opts = {}) {
+    return _sendVacancyFollowup(this, vacancyId, opts);
+  }
+
+  async redraftVacancyFollowup(vacancyId, opts = {}) {
+    return _redraftVacancyFollowup(this, vacancyId, opts);
   }
 
   async handleUpdate(update) {

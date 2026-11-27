@@ -1077,9 +1077,12 @@ test('/digest делит сегодня/воронку, /stats считает к
     const digest = await agent.digest();
     assert.equal(digest.invitationsToday, 1);
     assert.equal(digest.invitations, 2);
+    assert.equal(digest.viewedPending, 1);
+    assert.equal(digest.unreadPending, 0);
     assert.equal(digest.pendingChats, 1);
     assert.match(sent[0].text, /<b>За сегодня<\/b>/);
     assert.match(sent[0].text, /<b>Всего в воронке<\/b>/);
+    assert.match(sent[0].text, /Ждут ответа: <b>1<\/b> \(👀 просмотрено: <b>1<\/b> · ⏳ не просмотрено: <b>0<\/b>\)/);
     assert.match(sent[0].text, /Новых приглашений: <b>1<\/b>/);
     assert.match(sent[0].text, /Приглашения: <b>2<\/b>/);
     assert.match(sent[0].text, /Чаты ждут ответа: <b>1<\/b>/);
@@ -1431,6 +1434,187 @@ test('scanOnce прерывает внешний цикл запросов пр�
     assert.match(res.captchaReason, /ai-first/);
     assert.equal(visitedUrls.length, 1);
     assert.equal(broughtToFront, 1);
+  } finally {
+    db.close();
+  }
+});
+
+test('checkStatusesOnce уведомляет при просмотре и оффере без спама, а /statuses показывает списки', async () => {
+  const db = openDb(':memory:');
+  const sent = [];
+  let negState = 'READ';
+  let currentUrl = '';
+  const statusPage = {
+    goto: async (url) => { currentUrl = url; },
+    waitForTimeout: async () => {},
+    url: () => currentUrl,
+    locator: (sel) => sel === 'body' ? { innerText: async () => 'Переговоры' } : { count: async () => 0 },
+    evaluate: async () => {
+      if (currentUrl.includes('state=READ') && !currentUrl.includes('state=UNREAD') && negState === 'READ') {
+        return [{ id: '888001', chatId: '5888001', title: 'AI Engineer', company: 'НейроКорп', text: 'просмотрено' }];
+      }
+      if (currentUrl.includes('state=HIRED') && negState === 'HIRED') {
+        return [{ id: '888001', chatId: '5888001', title: 'AI Engineer', company: 'НейроКорп', text: 'принят' }];
+      }
+      if (currentUrl.includes('state=UNREAD') && !currentUrl.includes('state=READ')) {
+        return [{ id: '888002', chatId: '', title: 'Промпт-инженер', company: 'Вектор', text: 'не просмотрено' }];
+      }
+      return [];
+    }
+  };
+  const agent = {
+    db,
+    cfg: { hh: { base: 'https://spb.hh.ru' }, limits: { dailyFollowups: 10 } },
+    tg: { chatId: '42', answerCallback: async () => {}, edit: async () => {} },
+    page: async () => statusPage,
+    lock: async (_, fn) => fn(),
+    checkStatuses: Agent.prototype.checkStatuses,
+    checkStatusesOnce: Agent.prototype.checkStatusesOnce,
+    send: async (text) => { sent.push(text); return { message_id: sent.length }; },
+    log: () => {}
+  };
+
+  try {
+    upsertVacancy(db, { id: '888001', title: 'AI Engineer', company: 'НейроКорп', url: 'https://spb.hh.ru/vacancy/888001', snippet: 's', query: 'q' });
+    recordApplication(db, { vacancyId: '888001', resumeKey: 'ai', status: 'applied' });
+    setApplicationHhStatus(db, '888001', 'sent');
+
+    await agent.checkStatuses();
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /👀 Просмотрен отклик: <b>AI Engineer<\/b> — НейроКорп/);
+    assert.equal(getChat(db, '5888001')?.vacancy_id, '888001');
+
+    // Повторный прогон при том же статусе viewed не шлёт дубль.
+    await agent.checkStatuses();
+    assert.equal(sent.length, 1);
+
+    // /statuses выводит сводку просмотренных и не просмотренных.
+    await Agent.prototype.handleUpdate.call(agent, { message: { chat: { id: 42 }, text: '/statuses' } });
+    const summary = sent.at(-1);
+    assert.match(summary, /👀 <b>Просмотрены, без ответа \(1\):<\/b>/);
+    assert.match(summary, /AI Engineer/);
+    assert.match(summary, /⏳ <b>Ещё не просмотрены \(1\):<\/b>/);
+    assert.match(summary, /Промпт-инженер/);
+
+    // Переход в hired шлёт уведомление об оффере.
+    negState = 'HIRED';
+    await agent.checkStatuses();
+    assert.match(sent.at(-1), /🥳 Принят \/ оффер: <b>AI Engineer<\/b>/);
+  } finally {
+    db.close();
+  }
+});
+
+test('scanOnce читает ленту рекомендаций resume:ai и передаёт AI-сниппеты >=28 в llmRefine', async () => {
+  const db = openDb(':memory:');
+  const urls = [];
+  const llmSeen = [];
+  const searchPage = {
+    goto: async (url) => { urls.push(url); },
+    waitForTimeout: async () => {},
+    url: () => urls.at(-1) || 'https://spb.hh.ru/search/vacancy',
+    locator: () => ({ innerText: async () => '' }),
+    evaluate: async () => urls.at(-1)?.includes('resume=resume-ai-id')
+      ? [{ id: '900001', title: 'Разработчик RPA', company: 'РПА Про', salary: '', experience: '', url: 'https://spb.hh.ru/vacancy/900001', snippet: 'RPA и автоматизация процессов на Python, Playwright и REST API с AI-модулями и LLM', remote: true }]
+      : []
+  };
+  const agent = {
+    db,
+    cfg: {
+      hh: { base: 'https://spb.hh.ru', remoteOnly: true, pages: 1, queriesAI: ['llm'], queriesDirect: [], excludeCompanies: [], excludeKeywords: [], excludeKeywordExceptions: [], minSalary: 50000 },
+      resumes: { ai: { id: 'resume-ai-id', title: 'AI' }, direct: { id: 'd', title: 'D' } },
+      threshold: 55,
+      autoApply: false,
+      limits: { dailyApplications: 8 }
+    },
+    profile: { fullName: 'Тест', city: 'СПб', experience: '2 г.', roles: { ai: { headline: 'AI', skills: ['Python', 'LLM'] }, direct: { headline: 'Dir', skills: [] } } },
+    llm: async () => { llmSeen.push(true); return '{"score": 74, "resume": "ai", "reason": "подходит по автоматизации"}'; },
+    page: async () => searchPage,
+    rescoreBorderline: async () => [],
+    skipExamples: () => [],
+    notifyVacancy: async (v) => { setVacancyStatus(db, v.id, 'notified'); return true; },
+    send: async () => true,
+    log: () => {}
+  };
+
+  try {
+    const res = await Agent.prototype.scanOnce.call(agent, {});
+    assert.ok(urls.some((u) => u.includes('resume=resume-ai-id')));
+    assert.equal(llmSeen.length, 1);
+    assert.equal(res.matched, 1);
+    assert.equal(getVacancy(db, '900001')?.score, 74);
+  } finally {
+    db.close();
+  }
+});
+
+test('follow-up без строки в chats поддерживает переписывание, реплай и отправку с поиском chatId', async () => {
+  const db = openDb(':memory:');
+  const sent = [];
+  const edits = [];
+  const sentToHh = [];
+  let nextId = 50;
+  const fakeChatFrame = {
+    url: () => 'https://chatik.hh.ru/chat/599001',
+    locator: (sel) => sel.includes('text-input')
+      ? { last: () => ({ waitFor: async () => {}, evaluate: async (_, v) => { sentToHh.push(v); }, inputValue: async () => '' }) }
+      : { first: () => ({ count: async () => 1, click: async () => {} }) }
+  };
+  const chatPage = {
+    url: () => 'https://spb.hh.ru/chat/599001',
+    goto: async () => {},
+    waitForTimeout: async () => {},
+    evaluate: async () => '599001',
+    frames: () => [fakeChatFrame]
+  };
+  const agent = {
+    db,
+    cfg: {
+      hh: { base: 'https://spb.hh.ru' },
+      resumes: { ai: { title: 'AI' }, direct: { title: 'Директолог' } },
+      limits: { dailyFollowups: 10 }
+    },
+    profile: {
+      fullName: 'Тест', experience: '2 г.', roles: { ai: { headline: 'AI', facts: ['f1'] }, direct: { headline: 'Dir', facts: ['f2'] } }
+    },
+    tg: {
+      chatId: '42',
+      answerCallback: async () => {},
+      edit: async (messageId, text, keyboard) => { edits.push({ messageId, text, keyboard }); }
+    },
+    page: async () => chatPage,
+    lock: async (_, fn) => fn(),
+    llm: async () => 'Здравствуйте! Подскажите, актуален ли мой отклик на позицию?',
+    sendVacancyFollowup: Agent.prototype.sendVacancyFollowup,
+    redraftVacancyFollowup: Agent.prototype.redraftVacancyFollowup,
+    send: async (text, keyboard) => {
+      const msg = { message_id: ++nextId, text, keyboard };
+      sent.push(msg);
+      return msg;
+    },
+    log: () => {}
+  };
+
+  try {
+    upsertVacancy(db, { id: '333444', title: 'AI Engineer', company: 'Техно', url: 'https://spb.hh.ru/vacancy/333444', snippet: 'LLM', query: 'q' });
+    kvSet(db, 'followupVacDraft:333444', JSON.stringify({
+      text: 'Старый текст',
+      employer: 'Техно',
+      vacancy: 'AI Engineer',
+      vacancyUrl: 'https://spb.hh.ru/vacancy/333444'
+    }));
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: { id: 'cb1', data: 'redraft:333444:fv', message: { message_id: 10, chat: { id: 42 }, text: 'old' } }
+    });
+    assert.match(sent.at(-1).text, /Новый follow-up для <b>Техно<\/b>/);
+    const refMsg = sent.at(-1).message_id;
+
+    await Agent.prototype.handleUpdate.call(agent, {
+      callback_query: { id: 'cb2', data: 'fu:333444:v', message: { message_id: refMsg, chat: { id: 42 }, text: 'Карточка' } }
+    });
+    assert.equal(sentToHh.at(-1), 'Здравствуйте! Подскажите, актуален ли мой отклик на позицию?');
+    assert.equal(getChat(db, '599001')?.vacancy_id, '333444');
+    assert.match(edits.at(-1).text, /Follow-up отправлен в чат hh/);
   } finally {
     db.close();
   }

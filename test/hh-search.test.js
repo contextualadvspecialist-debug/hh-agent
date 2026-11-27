@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
-import { searchQuery, getVacancyDetails, detectCaptcha, CaptchaError } from '../src/hh-search.js';
+import { searchQuery, searchResumeFeed, getVacancyDetails, detectCaptcha, CaptchaError } from '../src/hh-search.js';
 
 const SERP_BASE = 'https://spb.hh.ru/search/vacancy';
 const VAC_URL = 'https://spb.hh.ru/vacancy/12345678';
@@ -127,6 +127,19 @@ test('searchQuery, getVacancyDetails и detectCaptcha работают на HTML
       () => searchQuery(page, cfg, 'AI', 0),
       (e) => e instanceof CaptchaError && /выдаче/.test(e.message)
     );
+
+    let seenFeedUrl = '';
+    await page.route('https://spb.hh.ru/search/vacancy**', (route) => {
+      seenFeedUrl = route.request().url();
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: SERP_HTML });
+    });
+    const feedItems = await searchResumeFeed(page, cfg, '6a66fedbff115c09c00039ed1f6a3045786b62', 0);
+    const feedUrl = new URL(seenFeedUrl);
+    assert.equal(feedUrl.searchParams.get('resume'), '6a66fedbff115c09c00039ed1f6a3045786b62');
+    assert.equal(feedUrl.searchParams.get('order_by'), 'publication_time');
+    assert.equal(feedUrl.searchParams.get('work_format'), 'REMOTE');
+    assert.equal(feedUrl.searchParams.get('area'), null);
+    assert.equal(feedItems.length, 2);
   } finally {
     await browser.close();
   }

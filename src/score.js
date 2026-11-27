@@ -1,7 +1,11 @@
 const AI_WORDS = [
   'ai', 'ии', 'нейросет', 'нейронн', 'llm', 'промпт', 'prompt', 'gpt', 'chatgpt',
-  'чат-бот', 'чатбот', 'чат бот', 'автоматизац', 'n8n', 'make.com', 'ai-агент', 'ии-агент'
+  'чат-бот', 'чатбот', 'чат бот', 'автоматизац', 'n8n', 'make.com', 'make', 'zapier',
+  'ai-агент', 'ии-агент', 'вайбкодер', 'вайбкод', 'вейбкод', 'vibe', 'rpa', 'rag',
+  'cursor', 'claude code', 'langchain'
 ];
+
+const AI_DEV_WORDS = ['python', 'playwright', 'fastapi', 'telegram', 'rest api'];
 
 const DIRECT_WORDS = [
   'директ', 'контекст', 'ppc', 'performance', 'трафик', 'яндекс директ',
@@ -10,6 +14,9 @@ const DIRECT_WORDS = [
 
 const GOOGLE_ADS = ['google ads', 'google adwords', 'adwords', 'гугл ads'];
 const YANDEX_DIRECT = ['яндекс директ', 'яндекс.директ', 'директолог', 'рся', 'мастер кампаний'];
+
+const SOFT_CONTESTED = new Set(['поддержк', 'тимлид', 'team lead', 'teamlead', 'руководител', 'архитектор']);
+const HARD_NEGATIVE_STOP = ['продаж', 'холодн', 'call', 'cto', 'head of', 'principal'];
 
 const NEGATIVE = [
   'холодн', 'звонк', 'продаж', 'sdr', 'телемаркет', 'дизайнер', 'закупк', 'поддержк',
@@ -20,7 +27,7 @@ const NEGATIVE = [
   '1с', 'call-центр', 'оператор call', 'seo', 'ассистент маркетолога', 'помощник маркетолога'
 ];
 
-const SHORT_TOKENS = new Set(['ai', 'ии', 'sdr', 'coo', 'cmo', 'hr', '1с', 'gpt', 'llm', 'ppc', 'n8n']);
+const SHORT_TOKENS = new Set(['ai', 'ии', 'sdr', 'coo', 'cmo', 'hr', '1с', 'gpt', 'llm', 'ppc', 'n8n', 'rpa', 'rag', 'make', 'vibe']);
 
 function tokenHit(text, word) {
   if (!SHORT_TOKENS.has(word)) return text.includes(word);
@@ -43,6 +50,7 @@ export function ruleScore(vacancy, cfg = {}) {
   const title = normalize(vacancy.title);
   const body = normalize(`${vacancy.title} ${vacancy.snippet ?? ''}`);
   const ai = hits(body, AI_WORDS);
+  const aiDev = ai.length > 0 ? hits(body, AI_DEV_WORDS) : [];
   const direct = hits(body, DIRECT_WORDS);
   const titleAI = hits(title, AI_WORDS);
   const titleDirect = hits(title, DIRECT_WORDS);
@@ -51,6 +59,7 @@ export function ruleScore(vacancy, cfg = {}) {
   let score = 30;
   score += Math.min(36, titleAI.length * 18 + titleDirect.length * 18);
   score += Math.min(15, ai.length * 3 + direct.length * 3);
+  if (aiDev.length) score += Math.min(6, aiDev.length * 2);
   if (hits(title, STRONG_TITLE).length) score += 12;
   if (!titleAI.length && !titleDirect.length) score -= 15;
 
@@ -62,7 +71,15 @@ export function ruleScore(vacancy, cfg = {}) {
   const expPenalty = { moreThan6: -12, between3And6: -4 };
   if (vacancy.experience && expPenalty[vacancy.experience]) score += expPenalty[vacancy.experience];
 
-  score -= Math.min(60, negative.length * 25);
+  // Спорные роли вроде поддержки/лида в AI-вакансии без стоп-слов пускаем мягче, чтобы решение принял llmRefine.
+  const hasHardStop = hits(title, HARD_NEGATIVE_STOP).length > 0
+    || negative.some((w) => !SOFT_CONTESTED.has(w));
+  const softAllowed = (titleAI.length > 0 || ai.length >= 2) && !hasHardStop;
+  const negativePenalty = negative.reduce(
+    (sum, w) => sum + (softAllowed && SOFT_CONTESTED.has(w) ? 8 : 25),
+    0
+  );
+  score -= Math.min(60, negativePenalty);
 
   const aiWeight = titleAI.length * 2 + ai.length;
   const directWeight = titleDirect.length * 2 + direct.length;
@@ -86,6 +103,7 @@ export function ruleScore(vacancy, cfg = {}) {
     : aiWeight >= directWeight ? 'ai' : 'direct';
   const reasons = [];
   if (ai.length) reasons.push(`AI: ${[...new Set(ai)].slice(0, 4).join(', ')}`);
+  if (aiDev.length) reasons.push(`стек: ${[...new Set(aiDev)].slice(0, 3).join(', ')}`);
   if (direct.length) reasons.push(`реклама: ${[...new Set(direct)].slice(0, 4).join(', ')}`);
   if (googleOnly && directWeight >= aiWeight) reasons.push('только Google Ads');
   if (negative.length) reasons.push(`минусы: ${[...new Set(negative)].slice(0, 3).join(', ')}`);
@@ -101,7 +119,7 @@ export function ruleScore(vacancy, cfg = {}) {
 export async function llmRefine(llmChatFn, profile, vacancy, base, negatives = []) {
   const prompt = `Ты помогаешь соискателю отбирать вакансии. Оцени, насколько вакансия подходит кандидату.
 
-Кандидат: ${profile.fullName}, ${profile.city}. Опыт: ${profile.experience} — ${profile.roles.direct.headline} и ${profile.roles.ai.headline}. Ищет удалённую работу; целится в junior/middle-роли, где нужны практические навыки LLM-агентов, промптов и автоматизации.
+Кандидат: ${profile.fullName}, ${profile.city}. Опыт: ${profile.experience} — ${profile.roles.direct.headline} и ${profile.roles.ai.headline}. Ищет удалённую работу; целится в junior/middle-роли, где нужны практические навыки LLM-агентов, промптов, автоматизации и AI-разработки (Python, Node.js, REST API, SQL).
 Навыки рекламы (основной инструмент — Яндекс Директ; вакансии только про Google Ads не подходят): ${profile.roles.direct.skills.join(', ')}.
 Навыки AI: ${profile.roles.ai.skills.join(', ')}.
 

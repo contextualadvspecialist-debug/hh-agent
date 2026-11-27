@@ -273,3 +273,32 @@ ${editHint && chat?.draft ? `\nПредыдущий черновик ответ�
 
   return String(raw).replace(/\u00a0/g, ' ').trim().slice(0, 1200);
 }
+
+export async function draftVacancyFollowup(agent, vacancyId, hint = '') {
+  if (!agent.llm) throw new Error('LLM не настроен');
+  const v = getVacancy(agent.db, vacancyId);
+  const app = getApplication(agent.db, vacancyId);
+  let prevText = '';
+  try {
+    prevText = JSON.parse(kvGet(agent.db, `followupVacDraft:${vacancyId}`, '{}'))?.text ?? '';
+  } catch { /* битый черновик игнорируем */ }
+  const sentLetter = app?.letter ? app.letter.slice(0, 800) : '';
+  const editHint = String(hint ?? '').trim().slice(0, 300);
+
+  const expShort = agent.profile.experienceShort ?? agent.profile.experience;
+  const prompt = `Ты помогаешь кандидату написать короткое вежливое напоминание (follow-up) по отклику на hh.ru без ответа.
+
+Кандидат: ${agent.profile.fullName}, ${expShort} опыта, ${agent.profile.roles.direct.headline} и ${agent.profile.roles.ai.headline}.
+Факты: ${agent.profile.roles.ai.facts.concat(agent.profile.roles.direct.facts).slice(0, 6).join('; ')}.
+
+Вакансия: «${v?.title || ''}», компания ${v?.company || ''}.
+${sentLetter ? `Ранее отправленное письмо:\n<sent_letter>\n${sentLetter}\n</sent_letter>\n` : ''}${editHint && prevText ? `Предыдущий черновик follow-up:\n<previous_draft>\n${prevText.slice(0, 1000)}\n</previous_draft>\n` : ''}
+Напиши 1–3 коротких предложения для чата hh.ru: уточнить статус отклика и подчеркнуть готовность обсудить задачи. Без подписи и markdown.${editHint ? `\n\nПожелание кандидата к правке (учти, не выдумывай фактов): ${editHint}` : ''}`;
+
+  const raw = await agent.llm([
+    { role: 'system', content: 'Пиши короткие вежливые follow-up сообщения для чата hh.ru на русском без воды и шаблонных штампов.' },
+    { role: 'user', content: prompt }
+  ], { temperature: 0.6, maxTokens: 400 });
+
+  return String(raw).replace(/\u00a0/g, ' ').trim().slice(0, 900);
+}

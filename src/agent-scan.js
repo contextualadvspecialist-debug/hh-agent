@@ -1,5 +1,5 @@
 import { AuthError, checkLoggedIn } from './browser.js';
-import { searchQuery, getVacancyDetails, CaptchaError } from './hh-search.js';
+import { searchQuery, searchResumeFeed, getVacancyDetails, CaptchaError } from './hh-search.js';
 import { isDuplicate, isDescriptionDuplicate } from './dedupe.js';
 import { ruleScore, llmRefine } from './score.js';
 import {
@@ -46,7 +46,9 @@ export async function scanOnce(agent, { direct = false } = {}) {
   const known = recentVacancies(agent.db, 800);
   const knownTexts = recentSnippets(agent.db, 800);
 
+  const aiResumeId = agent.cfg.resumes?.ai?.id;
   const batches = [
+    ...(aiResumeId ? [{ resumeId: aiResumeId, query: 'resume:ai', pool: 'ai' }] : []),
     ...(agent.cfg.hh.queriesAI ?? []).map((q) => ({ query: q, pool: 'ai' })),
     ...(direct ? (agent.cfg.hh.queriesDirect ?? []).map((q) => ({ query: q, pool: 'direct' })) : [])
   ];
@@ -56,11 +58,13 @@ export async function scanOnce(agent, { direct = false } = {}) {
   let searchCaptcha = false;
   let captchaReason = '';
 
-  outer: for (const { query, pool } of batches) {
+  outer: for (const { query, pool, resumeId } of batches) {
     for (let p = 0; p < (agent.cfg.hh.pages ?? 1); p++) {
       let items = [];
       try {
-        items = await searchQuery(page, agent.cfg, query, p);
+        items = resumeId
+          ? await searchResumeFeed(page, agent.cfg, resumeId, p)
+          : await searchQuery(page, agent.cfg, query, p);
       } catch (e) {
         if (isAuthError(e)) throw e;
         if (e instanceof CaptchaError) {
@@ -110,7 +114,8 @@ export async function scanOnce(agent, { direct = false } = {}) {
 
     for (const item of preliminary) {
       if (captchaStop || detailed >= budget) break;
-      if (item.base.score < 30 || (item.v.snippet && item.v.snippet.length >= 80)) continue;
+      const minEnrich = item.v?.pool === 'ai' ? 25 : 30;
+      if (item.base.score < minEnrich || (item.v.snippet && item.v.snippet.length >= 80)) continue;
       detailed++;
       try {
         const details = await getVacancyDetails(page, agent.cfg, item.v.id);
@@ -138,11 +143,16 @@ export async function scanOnce(agent, { direct = false } = {}) {
   const negatives = agent.skipExamples();
   const scoreList = async (preliminary, { status }) => {
     const matched = [];
-    for (const { v, base } of preliminary) {
+    // Пересортируем по актуальному rule-баллу после enrich(), чтобы топ-кандидаты гарантированно получили бюджет LLM.
+    const ordered = [...preliminary].sort((a, b) => b.base.score - a.base.score);
+    for (const { v, base } of ordered) {
       let result = base;
       let by = 'rule';
       let llmAt = '';
-      if (agent.llm && base.score >= 35 && llmUsed < 60) {
+      const aiSnippetCandidate = v?.pool === 'ai'
+        && base.score >= 28
+        && String(base.reason ?? '').includes('AI:');
+      if (agent.llm && (base.score >= 35 || aiSnippetCandidate) && llmUsed < 60) {
         llmUsed++;
         try {
           const refined = await llmRefine(agent.llm, agent.profile, v, base, negatives);

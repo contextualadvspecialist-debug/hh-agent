@@ -195,3 +195,33 @@ export async function sendChatMessage(page, cfg, chatId, text) {
   if (left.trim()) throw new Error('сообщение не отправилось: поле не очистилось');
   return true;
 }
+
+export async function findChatIdForVacancy(page, cfg, vacancyId) {
+  const id = String(vacancyId ?? '').trim();
+  if (!id) return '';
+  await page.goto(`${cfg.hh.base}/vacancy/${id}`, { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(1500);
+  const directId = await page.evaluate(() => {
+    const href = document.querySelector('a[href*="/chat/"]')?.getAttribute('href') ?? '';
+    return (href.match(/\/chat\/(\d+)/) || [])[1] ?? '';
+  }).catch(() => '');
+  if (directId) return directId;
+
+  // Фолбэк через страницу «Переговоры»: там часто есть прямая кнопка перехода в чат отклика.
+  for (const query of ['state=READ', 'state=UNREAD']) {
+    await page.goto(`${cfg.hh.base}/applicant/negotiations?filter=all&${query}`, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1500);
+    const fromNeg = await page.evaluate((targetId) => {
+      for (const card of document.querySelectorAll('[data-qa="negotiations-item"]')) {
+        const vacHref = card.querySelector('a[href*="/vacancy/"]')?.getAttribute('href') ?? '';
+        if (!vacHref.includes(`/vacancy/${targetId}`)) continue;
+        const chatHref = card.querySelector('a[href*="/chat/"]')?.getAttribute('href') ?? '';
+        const found = (chatHref.match(/\/chat\/(\d+)/) || [])[1] ?? '';
+        if (found) return found;
+      }
+      return '';
+    }, id).catch(() => '');
+    if (fromNeg) return fromNeg;
+  }
+  return '';
+}

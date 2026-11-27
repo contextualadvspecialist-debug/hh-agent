@@ -136,3 +136,42 @@ test('proposeFollowups сохраняет chatMsg для правки репла
     db.close();
   }
 });
+
+test('findFollowupCandidates и proposeFollowups подтягивают просмотренные/висящие отклики без строки в chats', async () => {
+  const db = openDb(':memory:');
+  const sent = [];
+  try {
+    upsertVacancy(db, { id: 'v_sent', title: 'Директолог', company: 'КомпА', url: 'https://spb.hh.ru/vacancy/v_sent', snippet: 'Яндекс Директ', query: 'q' });
+    upsertVacancy(db, { id: 'v_viewed', title: 'AI-инженер', company: 'КомпБ', url: 'https://spb.hh.ru/vacancy/v_viewed', snippet: 'LLM и промпты', query: 'q' });
+    recordApplication(db, { vacancyId: 'v_sent', resumeKey: 'direct', status: 'applied' });
+    recordApplication(db, { vacancyId: 'v_viewed', resumeKey: 'ai', status: 'imported' });
+    setApplicationHhStatus(db, 'v_sent', 'sent');
+    setApplicationHhStatus(db, 'v_viewed', 'viewed');
+    db.prepare("UPDATE applications SET hh_status_at = '2026-01-05T10:00:00.000Z', applied_at = '2026-01-05T10:00:00.000Z'").run();
+
+    const found = findFollowupCandidates(db, { minWorkingDays: 3, limit: 10, now: new Date('2026-01-12T10:00:00.000Z') });
+    assert.equal(found.length, 2);
+    assert.equal(found[0].vacancyId, 'v_viewed');
+    assert.equal(found[0].chatId, '');
+    assert.equal(found[1].vacancyId, 'v_sent');
+
+    const agent = {
+      db,
+      cfg: { hh: { base: 'https://spb.hh.ru' }, limits: { dailyFollowups: 10, followupWorkingDays: 3, sendWindow: { from: 0, to: 24 } } },
+      send: async (text, keyboard) => {
+        sent.push({ text, keyboard });
+        return { message_id: 700 + sent.length };
+      }
+    };
+    const count = await proposeFollowups(agent);
+    assert.equal(count, 2);
+    assert.deepEqual(sent[0].keyboard.flat().map((b) => b.callback_data || b.url), [
+      'fu:v_viewed:v', 'redraft:v_viewed:fv', 'fusk:v_viewed:v', 'https://spb.hh.ru/vacancy/v_viewed'
+    ]);
+    assert.match(sent[0].text, /👀 просмотрено/);
+    const draft = JSON.parse(db.prepare("SELECT v FROM kv WHERE k = 'followupVacDraft:v_viewed'").get().v);
+    assert.match(draft.text, /AI-инженер/);
+  } finally {
+    db.close();
+  }
+});

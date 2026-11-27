@@ -21,8 +21,11 @@ async function readCards(page) {
       const a = card.querySelector('a[href*="/vacancy/"]');
       const id = (a?.getAttribute('href')?.match(/vacancy\/(\d+)/) || [])[1] ?? '';
       if (!id) return null;
+      const chatHref = card.querySelector('a[href*="/chat/"]')?.getAttribute('href') ?? '';
+      const chatId = (chatHref.match(/\/chat\/(\d+)/) || [])[1] ?? '';
       return {
         id,
+        chatId,
         title: clean(card.querySelector('[data-qa="negotiations-item-vacancy"]')?.innerText),
         company: clean(card.querySelector('[data-qa="negotiations-item-company"]')?.innerText),
         text: clean(card.innerText).slice(0, 600)

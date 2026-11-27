@@ -347,6 +347,28 @@ export function countApplicationsByHhStatus(db, status) {
   return db.prepare('SELECT COUNT(*) AS n FROM applications WHERE hh_status = ?').get(status)?.n ?? 0;
 }
 
+export function listApplicationsByHhStatus(db, statuses = [], limit = 8) {
+  const list = Array.isArray(statuses) ? statuses : [statuses];
+  if (!list.length) return [];
+  const placeholders = list.map(() => '?').join(', ');
+  return db.prepare(`
+    SELECT
+      a.vacancy_id,
+      a.status,
+      a.hh_status,
+      a.hh_status_at,
+      a.applied_at,
+      v.title,
+      v.company,
+      v.url
+    FROM applications a
+    LEFT JOIN vacancies v ON v.id = a.vacancy_id
+    WHERE a.hh_status IN (${placeholders})
+    ORDER BY COALESCE(NULLIF(a.hh_status_at, ''), NULLIF(a.applied_at, ''), v.found_at, '') DESC
+    LIMIT ?
+  `).all(...list, limit);
+}
+
 export function countApplicationsByHhStatusSince(db, status, isoFrom) {
   return db.prepare('SELECT COUNT(*) AS n FROM applications WHERE hh_status = ? AND hh_status_at >= ?')
     .get(status, isoFrom)?.n ?? 0;
