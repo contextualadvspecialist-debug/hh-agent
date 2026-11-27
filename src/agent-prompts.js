@@ -190,9 +190,10 @@ export async function draftAnswers(agent, v, questions, { hint = '' } = {}) {
     return `${i + 1}. ${q.label}${typeHint}${opts}`;
   }).join('\n');
 
+  const expShort = agent.profile.experienceShort ?? agent.profile.experience;
   const prompt = `Работодатель задаёт вопросы в форме отклика на hh.ru. Напиши ответы от лица кандидата.
 
-Кандидат: ${agent.profile.fullName}, ${agent.profile.city}, опыт ${agent.profile.experience}, последнее место — ${agent.profile.lastCompany} (${role.headline}).
+Кандидат: ${agent.profile.fullName}, ${agent.profile.city}, опыт ${expShort}, последнее место — ${agent.profile.lastCompany} (${role.headline}).
 Факты (только они, ничего не выдумывать):
 ${role.facts.map((f) => `- ${f}`).join('\n')}
 Условия: ${agent.profile.availability}. Контакты: Telegram ${agent.profile.contacts.telegram}, телефон ${agent.profile.contacts.phone}.
@@ -246,9 +247,10 @@ export async function draftReply(agent, chatId, hint = '') {
     : sentLetterFor(agent, chat);
   const editHint = String(hint ?? '').trim().slice(0, 300);
 
+  const expShort = agent.profile.experienceShort ?? agent.profile.experience;
   const prompt = `Ты помогаешь кандидату отвечать работодателю в чате hh.ru.
 
-Кандидат: ${agent.profile.fullName}, ${agent.profile.experience} опыта, ${agent.profile.roles.direct.headline} и ${agent.profile.roles.ai.headline}.
+Кандидат: ${agent.profile.fullName}, ${expShort} опыта, ${agent.profile.roles.direct.headline} и ${agent.profile.roles.ai.headline}.
 Факты: ${agent.profile.roles.ai.facts.concat(agent.profile.roles.direct.facts).slice(0, 6).join('; ')}.
 Условия: ${agent.profile.availability}. Telegram: ${agent.profile.contacts.telegram}. Телефон: ${agent.profile.contacts.phone}.
 
